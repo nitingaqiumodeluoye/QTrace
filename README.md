@@ -28,7 +28,7 @@ call func: memcpy(0x7a3c060000, 0x7a3c050010, 0x20, 0x0, 0x0, 0x0, 0x0, 0x0)
 
 # Usage
 
-当前工作分支配置为追踪 **TrustAttestorNativeBridge.nativeRun**（`libTrustAttestor.so`，ELF `0x1A73C0`），入口校验、CI 出包和注入方式见 [TrustAttestor 说明](docs/TrustAttestor.md)。
+当前工作分支定向追踪 **TrustAttestor 设备环境检查函数**（`libTrustAttestor.so`，ELF `0x7097A8`），仅首轮调用、函数内插桩，记录上限 25 万条指令或约 64 MiB。入口校验、限额语义、CI 出包和注入方式见 [TrustAttestor 说明](docs/TrustAttestor.md)。
 0.将nativelib\src\main\cpp\qbdi-arm64\lib 目录下的libQBDI.zip解压出libQBDI.a，置于nativelib\src\main\cpp\qbdi-arm64\lib目录下。或去qbdi官方 https://github.com/QBDI/QBDI/releases/ 下载最新的libQBDI.a，注意选择andorid aarch64架构的,置于nativelib\src\main\cpp\qbdi-arm64\lib目录下
 
 1.将trace的目标so push到/data/local/tmp目录下

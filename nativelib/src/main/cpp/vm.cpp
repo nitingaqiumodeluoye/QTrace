@@ -34,6 +34,16 @@ bool debugInsn = false;
 func_arg_8 ori_arg8{};
 static std::atomic_flag traceInProgress = ATOMIC_FLAG_INIT;
 static TraceFilter traceFilter = nullptr;
+static size_t maxTraceInstructions = 0;
+static size_t maxTraceBytes = 0;
+static size_t recordedInstructions = 0;
+static bool recordingCapped = false;
+
+void setTraceLimits(size_t instructions, size_t bytes)
+{
+    maxTraceInstructions = instructions;
+    maxTraceBytes = bytes;
+}
 
 
 void setBufferSize(int size)
@@ -280,7 +290,7 @@ size_t trace(size_t regs[31])
     struct timeval start, end;
     gettimeofday(&start, nullptr);
     vm* vm_ = new vm();
-    auto qvm = vm_->init(_g_trace_data->start,_g_trace_data->end);
+    auto qvm = vm_->init(function_address, _g_trace_data->end);
     if (!vm_->initialized) {
         LOGE("QBDI VM initialization failed, falling back to original function");
         delete vm_;
@@ -324,11 +334,20 @@ size_t trace(size_t regs[31])
 
     pending = PendingInst{};
     lastAddr = 0;
+    recordedInstructions = 0;
+    recordingCapped = false;
+    appendformat("# trace range=[0x%zx,0x%zx) instruction_limit=%zu byte_threshold=%zu\n",
+                 function_address - _g_trace_data->base,
+                 _g_trace_data->end - _g_trace_data->base,
+                 maxTraceInstructions, maxTraceBytes);
     QBDI::rword qbdi_retval = 0;
     LOGE("trace begin");
     bool qbdi_success = qvm.call(&qbdi_retval, (uint64_t)function_address);
     LOGE("trace end");
     flushPending(qbdi_state);
+    appendformat("# target_return=0x%zx recorded_instructions=%zu truncated=%s qbdi_success=%s\n",
+                 static_cast<size_t>(qbdi_retval), recordedInstructions,
+                 recordingCapped ? "true" : "false", qbdi_success ? "true" : "false");
     if (qbdi_success) {
         if (writelog()) {
             LOGE("trace completed successfully %s",_logger->logfile.c_str());
@@ -460,6 +479,20 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
     //上一条指令的信息全部拿到了，写入
     flushPending(gprState);
     pending.callLen = 0;
+    if (recordingCapped) return QBDI::VMAction::CONTINUE;
+    const size_t loggedBytes = _logger && _logger->buf
+            ? _logger->lastwrite + sdslen(_logger->buf) : 0;
+    if ((maxTraceInstructions && recordedInstructions >= maxTraceInstructions) ||
+        (maxTraceBytes && loggedBytes >= maxTraceBytes)) {
+        recordingCapped = true;
+        appendformat("# RECORDING_LIMIT reached instructions=%zu bytes=%zu; target continues, trace is partial\n",
+                     recordedInstructions, loggedBytes);
+        writelog();
+        LOGW("trace recording capped: instructions=%zu bytes=%zu; target execution continues",
+             recordedInstructions, loggedBytes);
+        return QBDI::VMAction::CONTINUE;
+    }
+    ++recordedInstructions;
 
     // 获取当前指令的分析信息
     const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION  | QBDI::ANALYSIS_OPERANDS);
@@ -657,6 +690,7 @@ QBDI::VMAction showPostInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI:
 
 QBDI::VMAction showMemoryAccess(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FPRState *fprState, void *data)
 {
+    if (recordingCapped || !pending.valid) return QBDI::VMAction::CONTINUE;
     const auto& accesses = vm->getInstMemoryAccess();   // 只调一次
     for (const auto &acc : accesses)
     {
@@ -719,12 +753,12 @@ QBDI::VM vm::init(size_t start,size_t end)
         return qvm;
     }
 
-    bool ret = qvm.addInstrumentedModuleFromAddr(reinterpret_cast<QBDI::rword>(start));
-    if(!ret)
-    {
-        LOGE("init vm fail");
+    if (start >= end) {
+        LOGE("invalid instrumentation range");
         return qvm;
     }
+    // Do not instrument the complete module or callees outside this function.
+    qvm.addInstrumentedRange(start, end);
     initialized = true;
     LOGE("init vm success");
     return qvm;

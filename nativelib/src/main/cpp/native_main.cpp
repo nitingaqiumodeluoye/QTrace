@@ -157,18 +157,24 @@ string libname;
 /*需要trace的函数地址*/
 size_t trace_func = 0;
 
+static bool firstEnvironmentTrace(size_t*)
+{
+    static std::atomic<bool> claimed{false};
+    return !claimed.exchange(true);
+}
+
 void config()
 {
     libname = "libTrustAttestor.so";
 
-    // TrustAttestor v1.2 (12), arm64: RegisterNatives(nativeRun).
-    // ELF virtual address, relative to dlpi_addr (load bias), not a maps base.
-    // mov x1,x2; mov x2,x3; b 0x1a92c0
-    trace_func = 0x1A73C0;
-    setTraceFilter(nullptr);
+    // TrustAttestor v1.2 (12), arm64 environment probe, FDE [0x7097A8,0x742B40).
+    // ELF virtual addresses relative to dlpi_addr, not the first executable map.
+    trace_func = 0x7097A8;
+    setTraceFilter(firstEnvironmentTrace);
+    setTraceLimits(250000, 64 * 1024 * 1024);
 
     //trace buffer 累计多少字节往本地写一次。设置为0表示每trace一条指令就写入本地
-    setBufferSize(0x01000000);//每16MiB写一次
+    setBufferSize(0x00100000);//每1MiB写一次
 
     //是否开启逐指令日志，每条指令trace都会输出在logcat中，数据量巨大，用于调试时使用。
     enableDebugInsn(false);
@@ -198,29 +204,29 @@ static void tryInstallTargetHook(const MapItemInfo& soinfo)
     struct Reset { ~Reset() { g_initializing.clear(); } } reset;
     if (g_targetHookInstalled.load()) return;
     constexpr uint8_t expectedEntry[] = {
-        0xe1, 0x03, 0x02, 0xaa, 0xe2, 0x03, 0x03, 0xaa,
-        0xbe, 0x07, 0x00, 0x14
+        0xfd, 0x7b, 0xba, 0xa9, 0xfc, 0x6f, 0x01, 0xa9,
+        0xfa, 0x67, 0x02, 0xa9, 0xf8, 0x5f, 0x03, 0xa9
     };
     uint8_t entry[sizeof(expectedEntry)] = {};
-    if (trace_func >= soinfo.size || sizeof(entry) > soinfo.size - trace_func) {
+    if (soinfo.size < 0x742B40 || trace_func >= soinfo.size || sizeof(entry) > soinfo.size - trace_func) {
         LOGE("trace function offset 0x%zx is outside %s (size 0x%zx)", trace_func, libname.c_str(), soinfo.size);
         return;
     }
     if (!safeReadMemory(soinfo.start + trace_func, entry, sizeof(entry)) ||
         memcmp(entry, expectedEntry, sizeof(entry)) != 0) {
-        LOGE("nativeRun entry mismatch at %p; check target version and ELF load bias", (void*)(soinfo.start + trace_func));
+        LOGE("environment probe entry mismatch at %p; check target version and ELF load bias", (void*)(soinfo.start + trace_func));
         return;
     }
     {
         initLibcTrace();
         addLibctrace();
         initHookData();
-        LOGI("TrustAttestorNativeBridge.nativeRun: load_bias=%p, ELF=0x%zx, entry=%p",
+        LOGI("environment probe: load_bias=%p, ELF=0x%zx, entry=%p",
              (void*)soinfo.start, trace_func, (void*)(soinfo.start + trace_func));
         _g_trace_data = new g_trace_data();
         _g_trace_data->base = soinfo.start;
         _g_trace_data->start = soinfo.start;
-        _g_trace_data->end = soinfo.end;
+        _g_trace_data->end = soinfo.start + 0x742B40;
         _g_trace_data->target = trace_func;
         _g_trace_data->module_name = libname;
         _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)(soinfo.start + trace_func),
@@ -232,7 +238,7 @@ static void tryInstallTargetHook(const MapItemInfo& soinfo)
             _g_trace_data = nullptr;
         } else {
             g_targetHookInstalled.store(true);
-            LOGI("nativeRun hook installed");
+            LOGI("environment probe hook installed: range=[0x7097a8,0x742b40), first invocation only");
         }
     }
 }

@@ -45,6 +45,8 @@ extern bool debugInsn;
 void setBufferSize(int);
 void enableDebugInsn(bool);
 void setTraceFilter(TraceFilter filter);
+// Limits stop recording, never stop/replay target execution. Zero means unlimited.
+void setTraceLimits(size_t instructions, size_t bytes);
 
 void sync_regs(size_t* regs,size_t pc,QBDI::GPRState* qbdi_state);
 void appendPendingCallArg(const std::string& index, const std::string& value);
