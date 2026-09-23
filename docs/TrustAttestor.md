@@ -39,7 +39,9 @@ frida -U -f com.lingqing.trustattestor -l inject.js
 
 ### xfinject 早期注入
 
-QTrace 构造函数注册 ShadowHook 的库构造完成回调，并检查已经加载的模块。目标未加载时立即返回；目标出现后才初始化追踪、校验入口并安装 hook。重复通知不会重复安装。不会捕获目标 ELF 构造函数内部已经执行的 nativeRun 调用，也不支持目标卸载后重新加载。
+QTrace 构造函数对 linker 的 `__loader_dlopen` / `__loader_android_dlopen_ext` 安装地址 hook，保留原始 caller 参数，并检查已经加载的模块。原加载函数成功返回后检查目标库，再初始化追踪、校验入口并安装 hook。重复通知不会重复安装。不会捕获目标 ELF 构造函数内部已经执行的 nativeRun 调用，也不支持目标卸载后重新加载。
+
+项目自带 ShadowHook 2.0.0 静态库的 `shadowhook_init()` 未调用 `sh_linker_init()`；因此 dl-init 回调即使注册成功也不会工作，不能仅凭头文件存在该 API 使用它。
 
 设备端 root 脚本内容：
 
@@ -52,7 +54,7 @@ QTrace 构造函数注册 ShadowHook 的库构造完成回调，并检查已经�
   -debug -log-file /data/local/tmp/xfinject-qtrace.log
 ```
 
-使用 `adb shell su -c "sh /data/local/tmp/run-qtrace.sh"` 执行该脚本（Git Bash 加 `MSYS_NO_PATHCONV=1`）。无需同时运行 `inject.js`。预期 QTrace logcat 先出现 `waiting for libTrustAttestor.so load (post-init callback)`，目标加载后出现 `nativeRun hook installed`。CI 仅验证构建，真机效果仍需确认。
+使用 `adb shell su -c "sh /data/local/tmp/run-qtrace.sh"` 执行该脚本（Git Bash 加 `MSYS_NO_PATHCONV=1`）。无需同时运行 `inject.js`。预期 QTrace logcat 先出现 `waiting for libTrustAttestor.so load (linker entry hooks)`，目标加载后出现 `nativeRun hook installed`。CI 仅验证构建，真机效果仍需确认。
 
 看到 QTrace 输出 `TrustAttestorNativeBridge.nativeRun: load_bias=..., ELF=0x1a73c0, entry=...` 后，在应用内触发扫描。日志输出到 `/storage/emulated/0/Android/data/com.lingqing.trustattestor/files/trace_logs/qbdi_*` 文件，完整路径由 logcat 输出。attach 模式只捕获安装 hook 后的调用；已经结束的扫描需要重新触发。
 

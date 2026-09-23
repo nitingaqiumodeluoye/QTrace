@@ -43,18 +43,61 @@ static MapItemInfo targetRange(const dl_phdr_info* info)
 
 static void tryInstallTargetHook(const MapItemInfo& soinfo);
 
-static void onTargetLoaded(dl_phdr_info* info, size_t, void*)
-{
-    if (info && isTargetPath(info->dlpi_name)) {
-        tryInstallTargetHook(targetRange(info));
-    }
-}
-
-static int checkLoadedTarget(dl_phdr_info* info, size_t size, void* data)
+static int checkLoadedTarget(dl_phdr_info* info, size_t, void*)
 {
     if (!isTargetPath(info->dlpi_name)) return 0;
-    onTargetLoaded(info, size, data);
+    tryInstallTargetHook(targetRange(info));
     return 1;
+}
+
+// Hook the linker entry, preserving caller_addr. Hooking libdl's wrapper would
+// change the caller used by Android's namespace selection.
+using LoaderOpen = void* (*)(const char*, int, const void*);
+using LoaderExt = void* (*)(const char*, int, const void*, const void*);
+static LoaderOpen originalLoaderOpen = nullptr;
+static LoaderExt originalLoaderExt = nullptr;
+static void* loaderOpenStub = nullptr;
+static void* loaderExtStub = nullptr;
+
+static void afterLoad(const char* path, void* handle)
+{
+    if (!handle || g_targetHookInstalled.load()) return;
+    if (isTargetPath(path)) LOGI("target loader returned: %s", path);
+    // Also covers the target being a dependency of the explicitly loaded ELF.
+    dl_iterate_phdr(checkLoadedTarget, nullptr);
+}
+
+static void* loaderOpen(const char* path, int flags, const void* caller)
+{
+    void* handle = originalLoaderOpen(path, flags, caller);
+    afterLoad(path, handle);
+    return handle;
+}
+
+static void* loaderExt(const char* path, int flags, const void* ext, const void* caller)
+{
+    void* handle = originalLoaderExt(path, flags, ext, caller);
+    afterLoad(path, handle);
+    return handle;
+}
+
+static void installLoaderHooks()
+{
+    void* linker = shadowhook_dlopen("linker64");
+    if (!linker) {
+        LOGE("cannot resolve linker64 for loader hooks");
+        return;
+    }
+    void* open = shadowhook_dlsym(linker, "__loader_dlopen");
+    void* ext = shadowhook_dlsym(linker, "__loader_android_dlopen_ext");
+    shadowhook_dlclose(linker);
+    if (open) loaderOpenStub = shadowhook_hook_func_addr(open, (void*)loaderOpen,
+                                                        (void**)&originalLoaderOpen);
+    if (!loaderOpenStub) LOGE("__loader_dlopen hook failed: %d", shadowhook_get_errno());
+    if (ext) loaderExtStub = shadowhook_hook_func_addr(ext, (void*)loaderExt,
+                                                     (void**)&originalLoaderExt);
+    if (!loaderExtStub) LOGE("__loader_android_dlopen_ext hook failed: %d", shadowhook_get_errno());
+    LOGI("loader hooks installed: dlopen=%p android_dlopen_ext=%p", loaderOpenStub, loaderExtStub);
 }
 
 
@@ -200,14 +243,11 @@ static void tryInstallTargetHook(const MapItemInfo& soinfo)
 void trace()
 {
     config();
-    // Register first so a concurrent load cannot fall between the scan and subscription.
-    int result = shadowhook_register_dl_init_callback(nullptr, onTargetLoaded, nullptr);
-    if (result != 0) {
-        LOGE("target load callback registration failed: %d", result);
-    } else {
-        LOGI("waiting for libTrustAttestor.so load (post-init callback)");
-    }
+    // The bundled static ShadowHook omits sh_linker_init(): dl-init callbacks
+    // can register successfully without any events. Use address hooks instead.
+    installLoaderHooks();
     dl_iterate_phdr(checkLoadedTarget, nullptr);
+    if (!g_targetHookInstalled.load()) LOGI("waiting for libTrustAttestor.so load (linker entry hooks)");
 }
 
 void test()
