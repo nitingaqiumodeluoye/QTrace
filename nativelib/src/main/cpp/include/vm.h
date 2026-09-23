@@ -34,6 +34,8 @@ struct g_trace_data{
     size_t start;
     size_t end;
     size_t target;
+    size_t recordStart = 0;
+    size_t recordEnd = 0;
     std::string module_name;
     void* hooktask;
     orig_func_t orig_addr;

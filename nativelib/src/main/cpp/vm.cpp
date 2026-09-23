@@ -290,7 +290,7 @@ size_t trace(size_t regs[31])
     struct timeval start, end;
     gettimeofday(&start, nullptr);
     vm* vm_ = new vm();
-    auto qvm = vm_->init(function_address, _g_trace_data->end);
+    auto qvm = vm_->init(_g_trace_data->start, _g_trace_data->end);
     if (!vm_->initialized) {
         LOGE("QBDI VM initialization failed, falling back to original function");
         delete vm_;
@@ -337,8 +337,8 @@ size_t trace(size_t regs[31])
     recordedInstructions = 0;
     recordingCapped = false;
     appendformat("# trace range=[0x%zx,0x%zx) instruction_limit=%zu byte_threshold=%zu\n",
-                 function_address - _g_trace_data->base,
-                 _g_trace_data->end - _g_trace_data->base,
+                 _g_trace_data->recordStart - _g_trace_data->base,
+                 _g_trace_data->recordEnd - _g_trace_data->base,
                  maxTraceInstructions, maxTraceBytes);
     QBDI::rword qbdi_retval = 0;
     LOGE("trace begin");
@@ -480,6 +480,15 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
     flushPending(gprState);
     pending.callLen = 0;
     if (recordingCapped) return QBDI::VMAction::CONTINUE;
+    // Keep the caller under QBDI so internal calls remain visible, but do not
+    // produce instruction/annotation output outside the selected probe.
+    if (_g_trace_data && _g_trace_data->recordEnd > _g_trace_data->recordStart &&
+        (gprState->pc < _g_trace_data->recordStart || gprState->pc >= _g_trace_data->recordEnd)) {
+        return QBDI::VMAction::CONTINUE;
+    }
+    if (recordedInstructions == 0) {
+        LOGI("record range first hit: pc=%p", (void*)gprState->pc);
+    }
     const size_t loggedBytes = _logger && _logger->buf
             ? _logger->lastwrite + sdslen(_logger->buf) : 0;
     if ((maxTraceInstructions && recordedInstructions >= maxTraceInstructions) ||
@@ -757,7 +766,7 @@ QBDI::VM vm::init(size_t start,size_t end)
         LOGE("invalid instrumentation range");
         return qvm;
     }
-    // Do not instrument the complete module or callees outside this function.
+    // Follow the module for reachability; PREINST independently filters output.
     qvm.addInstrumentedRange(start, end);
     initialized = true;
     LOGE("init vm success");
