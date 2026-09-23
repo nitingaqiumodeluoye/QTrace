@@ -33,6 +33,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Install pinned native toolchain
         run: sdkmanager "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION"
       - name: Unpack bundled QBDI
