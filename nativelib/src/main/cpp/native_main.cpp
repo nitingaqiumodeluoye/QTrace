@@ -11,11 +11,12 @@
 #include "jnitrace.h"
 #include "libctrace.h"
 #include "shadowhook.h"
+#include "TraceUtils.h"
 using namespace std;
 
 static void addHooks()
 {
-    addHook(0x71DD54,hook_0x71DD54);
+    // No libtiny-specific hooks: these offsets do not apply to TrustAttestor.
 }
 
 static void addLibctrace()
@@ -47,6 +48,10 @@ static void addLibctrace()
 
 static void addJNItrace()
 {
+    if (pJFunc == nullptr) {
+        LOGW("skip JNI trace registration: JNI function table is unavailable");
+        return;
+    }
     addJNITrace((void*)pJFunc->NewStringUTF,"NewStringUTF",trace_NewStringUTF);
     addJNITrace((void*)pJFunc->GetStringUTFChars,"GetStringUTFChars",trace_GetStringUTFChars);
     addJNITrace((void*)pJFunc->NewString,"NewString",trace_NewString);
@@ -78,15 +83,19 @@ size_t trace_func = 0;
 
 void config()
 {
-    libname = "libtiny.so";
+    libname = "libTrustAttestor.so";
 
     string localdir(libdir);
     libpath = localdir + libname;
 
-    trace_func = 0x173148;
+    // TrustAttestor v1.2 (12), arm64: RegisterNatives(nativeRun).
+    // ELF virtual address, relative to dlpi_addr (load bias), not a maps base.
+    // mov x1,x2; mov x2,x3; b 0x1a92c0
+    trace_func = 0x1A73C0;
+    setTraceFilter(nullptr);
 
     //trace buffer 累计多少字节往本地写一次。设置为0表示每trace一条指令就写入本地
-    setBufferSize(0x10000000);//每16M写一次
+    setBufferSize(0x01000000);//每16MiB写一次
 
     //是否开启逐指令日志，每条指令trace都会输出在logcat中，数据量巨大，用于调试时使用。
     enableDebugInsn(false);
@@ -99,10 +108,15 @@ void config()
 
 }
 
-void init_shadowhook()
+bool init_shadowhook()
 {
-    shadowhook_init(SHADOWHOOK_MODE_UNIQUE, true);
+    int result = shadowhook_init(SHADOWHOOK_MODE_UNIQUE, true);
+    if (result != 0) {
+        LOGE("shadowhook initialization failed: %d", result);
+        return false;
+    }
     shadowhook_set_debuggable(true);
+    return true;
 }
 
 void trace()
@@ -111,9 +125,12 @@ void trace()
     config();
 
     /*JNI Trace*/
-    initJni();
-    //添加监控的jni函数
-    addJNItrace();
+    if(initJni()) {
+        //添加监控的jni函数
+        addJNItrace();
+    } else {
+        LOGW("JNI trace disabled because JNIEnv initialization failed");
+    }
 
     /*libc Trace*/
     initLibcTrace();
@@ -128,14 +145,39 @@ void trace()
     auto soinfo = getSoBaseAddress(libpath.c_str(),libname.c_str());
     if(soinfo.start != 0)
     {
+        constexpr uint8_t expectedEntry[] = {
+            0xe1, 0x03, 0x02, 0xaa, 0xe2, 0x03, 0x03, 0xaa,
+            0xbe, 0x07, 0x00, 0x14
+        };
+        uint8_t entry[sizeof(expectedEntry)] = {};
+        if (trace_func >= soinfo.size || sizeof(entry) > soinfo.size - trace_func) {
+            LOGE("trace function offset 0x%zx is outside %s (size 0x%zx)",
+                 trace_func, libname.c_str(), soinfo.size);
+            return;
+        }
+        if (!safeReadMemory(soinfo.start + trace_func, entry, sizeof(entry)) ||
+            memcmp(entry, expectedEntry, sizeof(entry)) != 0) {
+            LOGE("nativeRun entry mismatch at %p; check target version and ELF load bias",
+                 (void*)(soinfo.start + trace_func));
+            return;
+        }
+        LOGI("TrustAttestorNativeBridge.nativeRun: load_bias=%p, ELF=0x%zx, entry=%p",
+             (void*)soinfo.start, trace_func, (void*)(soinfo.start + trace_func));
         _g_trace_data = new g_trace_data();
         _g_trace_data->base = soinfo.start;
         _g_trace_data->start = soinfo.start;
-        _g_trace_data->end = soinfo.start + soinfo.size;
+        _g_trace_data->end = soinfo.end;
         _g_trace_data->target = trace_func;
+        _g_trace_data->module_name = libname;
         _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)(_g_trace_data->start + _g_trace_data->target),
                                                             (void*)(hook_and_trace_arg8),
                                                             (void**)&ori_arg8);
+        if (_g_trace_data->hooktask == nullptr || ori_arg8 == nullptr) {
+            LOGE("failed to install entry hook at %p",
+                 (void*)(_g_trace_data->start + _g_trace_data->target));
+            delete _g_trace_data;
+            _g_trace_data = nullptr;
+        }
     }
     else
     {
@@ -153,6 +195,5 @@ void test()
 
 __unused __attribute__((constructor)) void init_main() {
     LOGE("Injected!");
-    init_shadowhook();
-    trace();
+    if (init_shadowhook()) trace();
 }

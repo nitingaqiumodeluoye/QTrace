@@ -151,6 +151,7 @@ bool isAsciiPrintableString(const uint8_t* data, size_t length) {
 
 // 使用 process_vm_readv 安全读取内存的函数
 bool safeReadMemory(uint64_t address, uint8_t* buffer, size_t length) {
+    if (address == 0 || buffer == nullptr || length == 0) return false;
     struct iovec local_iov;
     struct iovec remote_iov;
 
@@ -218,4 +219,40 @@ std::string analyzeParameters(const char* names[], uint64_t values[], int count)
         if (i < count - 1) output << ", ";
     }
     return output.str();
+}
+
+bool safeReadCString(uint64_t address, std::string& output, size_t maxLength) {
+    output.clear();
+    if (address == 0 || maxLength == 0) return false;
+
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0) return false;
+
+    while (output.size() < maxLength) {
+        const size_t pageOffset = static_cast<size_t>(address % static_cast<uint64_t>(pageSize));
+        const size_t pageRemaining = static_cast<size_t>(pageSize) - pageOffset;
+        const size_t readLength = std::min({pageRemaining, maxLength - output.size(), size_t(256)});
+        uint8_t buffer[256];
+        if (!safeReadMemory(address, buffer, readLength)) return !output.empty();
+
+        for (size_t i = 0; i < readLength; ++i) {
+            if (buffer[i] == '\0') return true;
+            output.push_back(static_cast<char>(buffer[i]));
+        }
+        address += readLength;
+    }
+    return true;
+}
+
+bool safeReadBytes(uint64_t address, size_t requestedLength, std::vector<uint8_t>& output,
+                   size_t maxLength) {
+    output.clear();
+    if (address == 0 || requestedLength == 0 || maxLength == 0) return false;
+    const size_t readLength = std::min(requestedLength, maxLength);
+    output.resize(readLength);
+    if (!safeReadMemory(address, output.data(), readLength)) {
+        output.clear();
+        return false;
+    }
+    return true;
 }

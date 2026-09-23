@@ -8,6 +8,7 @@
 #include "QBDI/State.h"
 #include "logger.h"
 #include <sstream>
+#include <string>
 #include "shadowhook.h"
 
 typedef void (*TraceCallBack)(QBDI::VM *vm, QBDI::GPRState *gprState);
@@ -15,12 +16,14 @@ typedef bool (*TraceFilter)(size_t regs[]);
 
 struct TraceFunc {
     TraceCallBack callback;
+    std::string name;
 };
 
 class vm {
 public:
     QBDI::VM init(size_t start,size_t end);
     size_t base;
+    bool initialized = false;
 private:
 
 };
@@ -31,6 +34,7 @@ struct g_trace_data{
     size_t start;
     size_t end;
     size_t target;
+    std::string module_name;
     void* hooktask;
     orig_func_t orig_addr;
 };
@@ -40,8 +44,12 @@ extern int bufsize ;
 extern bool debugInsn;
 void setBufferSize(int);
 void enableDebugInsn(bool);
+void setTraceFilter(TraceFilter filter);
 
 void sync_regs(size_t* regs,size_t pc,QBDI::GPRState* qbdi_state);
+void appendPendingCallArg(const std::string& index, const std::string& value);
+void appendPendingCallArg(size_t index, const std::string& value);
+void appendPendingCallHexdump(uint64_t address, const uint8_t* data, size_t size);
 
 typedef size_t (*func_arg_8)(size_t x0,size_t x1,size_t x2,size_t x3,size_t x4,size_t x5,size_t x6,size_t x7);
 extern func_arg_8 ori_arg8;

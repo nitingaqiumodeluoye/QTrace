@@ -7,7 +7,9 @@
 #include <asm-generic/unistd.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <vector>
+#include <algorithm>
 #include <string>
 #include <sstream>
 #include <sys/stat.h>
@@ -25,6 +27,7 @@ typedef uintptr_t _Unwind_Word;
 #endif
 #include"logger.h"
 #include "HookUtils.h"
+#include "TraceUtils.h"
 #include "elf.h"
 #include <fcntl.h>
 
@@ -375,55 +378,135 @@ size_t base64_encode(char *out, const uint8_t *data, size_t len) {
 
 MapItemInfo getSoBaseAddress(const char *libpath, const char *name) {
     MapItemInfo info{0};
-    if (name == nullptr) {
+    if (name == nullptr || *name == '\0') {
         return info;
     }
-    size_t start = 0;
-    size_t end = 0;
-    size_t len = 0;
-    char buffer[PATH_MAX];
-    memset(buffer, 0, PATH_MAX);
-    char prop[10];
-    memset(prop, 0, 10);
 
-    info.size = getLibRXsize(libpath);
-    FILE *raw = fopen(libpath,"r");
-    if (raw == nullptr) {
-        LOGD("open raw file error,please set libpath to your target lib.");
-        return info;
-    }
-    char header[HEADSIZE];
-    size_t read = fread(header,sizeof(char),HEADSIZE,raw);
-    if(read != HEADSIZE)
-    {
-        LOGD("read raw file error,size should > 0x100.");
-        fclose(raw);
-        return info;
+    // dlpi_addr is the ELF load bias. A maps start minus file offset can
+    // describe an APK container or a segment, not the relocated ELF base.
+    struct LoadedTarget {
+        const char* name;
+        MapItemInfo info;
+    } target{name, {0}};
+    dl_iterate_phdr([](dl_phdr_info* module, size_t, void* opaque) -> int {
+        auto* target = static_cast<LoadedTarget*>(opaque);
+        const char* path = module->dlpi_name;
+        if (path == nullptr) return 0;
+        const char* slash = strrchr(path, '/');
+        if (strcmp(slash == nullptr ? path : slash + 1, target->name) != 0) return 0;
+        const size_t base = static_cast<size_t>(module->dlpi_addr);
+        size_t end = base;
+        for (size_t i = 0; i < module->dlpi_phnum; ++i) {
+            const auto& segment = module->dlpi_phdr[i];
+            if (segment.p_type == PT_LOAD) {
+                end = std::max(end, base + static_cast<size_t>(segment.p_vaddr + segment.p_memsz));
+            }
+        }
+        if (end <= base) return 0;
+        target->info.start = base;
+        target->info.end = end;
+        target->info.size = end - base;
+        return 1;
+    }, &target);
+    if (target.info.size != 0) {
+        LOGI("found %s via linker: load_bias=%p,size=0x%zx", name,
+             (void*)target.info.start, target.info.size);
+        return target.info;
     }
 
     FILE *fp = fopen("/proc/self/maps", "r");
     if (fp == nullptr) {
-        LOGD("open maps error");
+        LOGE("open /proc/self/maps failed: %s", strerror(errno));
         return info;
     }
 
+    const size_t nameLength = strlen(name);
+    size_t minBase = SIZE_MAX;
+    size_t maxEnd = 0;
+    size_t len = 0;
     char *line = nullptr;
     while (getline(&line, &len, fp) != -1) {
-        if (line != nullptr && strstr(line,"r") && strstr(line,"x")) {
-            sscanf(line, "%lx-%lx", &start, &end);
-            if(memcmp((void*)start,header,HEADSIZE) == 0)
-            {
-                info.start = start;
-                info.end = end;
-                if(info.size == -1)
-                {
-                    LOGD("use end - start as size");
-                    info.size = end - start;
-                }
-                break;
-            }
+        size_t start = 0;
+        size_t end = 0;
+        size_t fileOffset = 0;
+        char perms[5] = {0};
+        char pathname[PATH_MAX] = {0};
+        int fields = sscanf(line, "%lx-%lx %4s %lx %*s %*s %4095[^\n]",
+                            &start, &end, perms, &fileOffset, pathname);
+        if (fields < 4) continue;
+
+        char* path = pathname;
+        while (*path == ' ') ++path;
+        char* deletedSuffix = strstr(path, " (deleted)");
+        if (deletedSuffix != nullptr) *deletedSuffix = '\0';
+        const size_t pathLength = strlen(path);
+        const bool nameMatches = pathLength >= nameLength &&
+                                 strcmp(path + pathLength - nameLength, name) == 0;
+        if (nameMatches) {
+            const size_t loadBase = start >= fileOffset ? start - fileOffset : start;
+            minBase = std::min(minBase, loadBase);
+            maxEnd = std::max(maxEnd, end);
         }
     }
+
+    if (minBase != SIZE_MAX && maxEnd > minBase) {
+        info.start = minBase;
+        info.end = maxEnd;
+        info.size = maxEnd - minBase;
+        free(line);
+        fclose(fp);
+        LOGI("found %s from maps path: base=%p,size=0x%zx", name,
+             (void*)info.start, info.size);
+        return info;
+    }
+
+    // 某些 APK/匿名映射不保留原始 SO 名，回退到 ELF 文件头匹配。
+    if (libpath == nullptr || *libpath == '\0') {
+        LOGE("target ELF path is empty");
+        free(line);
+        fclose(fp);
+        return info;
+    }
+    FILE *raw = fopen(libpath,"rb");
+    if (raw == nullptr) {
+        LOGE("open target ELF failed: %s", libpath);
+        free(line);
+        fclose(fp);
+        return info;
+    }
+    uint8_t header[HEADSIZE] = {0};
+    const size_t readLength = fread(header, 1, sizeof(header), raw);
+    fclose(raw);
+    if (readLength != sizeof(header)) {
+        LOGE("target ELF is too small: %s", libpath);
+        free(line);
+        fclose(fp);
+        return info;
+    }
+
+    rewind(fp);
+    while (getline(&line, &len, fp) != -1) {
+        size_t start = 0;
+        size_t end = 0;
+        size_t fileOffset = 0;
+        char perms[5] = {0};
+        if (sscanf(line, "%lx-%lx %4s %lx", &start, &end, perms, &fileOffset) != 4) continue;
+        if (fileOffset != 0 || strchr(perms, 'r') == nullptr) continue;
+
+        uint8_t mappedHeader[HEADSIZE] = {0};
+        if (safeReadMemory(start, mappedHeader, sizeof(mappedHeader)) &&
+            memcmp(mappedHeader, header, sizeof(header)) == 0) {
+            const size_t elfSize = getLibRXsize(libpath);
+            info.start = start;
+            info.size = elfSize == SIZE_MAX ? end - start : elfSize;
+            info.end = info.start + info.size;
+            LOGI("found %s by ELF header: base=%p,size=0x%zx", name,
+                 (void*)info.start, info.size);
+            break;
+        }
+    }
+
+    free(line);
     fclose(fp);
     return info;
 }
@@ -481,6 +564,7 @@ MapItemInfo getSoBaseAddressFromAddress(void* address) {
     if (min_start != SIZE_MAX && max_end != 0) {
         soinfo.start = min_start;
         soinfo.end = max_end;
+        soinfo.size = max_end - min_start;
     } else {
         LOGE("Failed to find so range for address %p", address);
     }
@@ -507,11 +591,19 @@ char* getAppName(){
         return appName;
     }
     FILE* f = fopen("/proc/self/cmdline","r");
-    size_t len;
+    if (f == nullptr) {
+        LOGE("can't open /proc/self/cmdline: %s", strerror(errno));
+        appName = strdup("unknown");
+        return appName;
+    }
+    size_t len = 0;
     char* line = nullptr;
     if(getline(&line,&len,f)==-1){
-        perror("can't get app name");
+        LOGE("can't get app name: %s", strerror(errno));
+        free(line);
+        line = strdup("unknown");
     }
+    fclose(f);
     appName = line;
     //LOGD("get appName %s",appName);
     return appName;
@@ -523,7 +615,8 @@ char* getPrivatePath(){
         return privatePath;
     }
     // 使用应用私有files目录，避免权限问题
-    sprintf(privatePath,"%s%s%s","/storage/emulated/0/Android/data/",getAppName(),"/files/");
+    snprintf(privatePath, sizeof(privatePath), "%s%s%s",
+             "/storage/emulated/0/Android/data/", getAppName(), "/files/");
     LOGI("Using private path: %s", privatePath);
     return privatePath;
 }

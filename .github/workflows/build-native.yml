@@ -1,0 +1,87 @@
+name: Build TrustAttestor QTrace
+
+on:
+  push:
+    branches:
+      - master
+      - 'ci/**'
+    paths:
+      - 'nativelib/src/main/cpp/**'
+      - 'inject.js'
+      - 'docs/TrustAttestor.md'
+      - '.github/workflows/build-native.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      NDK_VERSION: '27.2.12479018'
+      CMAKE_VERSION: '3.22.1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install pinned native toolchain
+        run: sdkmanager "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION"
+      - name: Unpack bundled QBDI
+        run: unzip -o nativelib/src/main/cpp/qbdi-arm64/lib/libQBDI.zip -d nativelib/src/main/cpp/qbdi-arm64/lib
+      - name: Check injection script
+        run: node --check inject.js
+      - name: Configure ARM64 library
+        run: |
+          "$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION/bin/cmake" \
+            -S nativelib/src/main/cpp -B build/native -G Ninja \
+            -DCMAKE_MAKE_PROGRAM="$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION/bin/ninja" \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release
+      - name: Build library
+        shell: bash
+        run: |
+          "$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION/bin/cmake" --build build/native --parallel 2 > build/native-build.log 2>&1 &
+          build_pid=$!
+          echo "Build PID: $build_pid"
+          result=0
+          wait "$build_pid" || result=$?
+          tail -n 30 build/native-build.log
+          echo "Build exit code: $result"
+          exit "$result"
+      - name: Package and verify artifact
+        run: |
+          mkdir -p dist
+          cp build/native/libnativelib.so inject.js dist/
+          cp docs/TrustAttestor.md dist/README.md
+          toolchain="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$toolchain/llvm-readelf" -h -d dist/libnativelib.so > dist/elf-info.txt
+          grep -q 'AArch64' dist/elf-info.txt
+          if grep -q 'libc++_shared.so' dist/elf-info.txt; then
+            echo 'Unexpected external C++ runtime dependency'
+            exit 1
+          fi
+          printf 'commit=%s\nndk=%s\nabi=arm64-v8a\ntarget=TrustAttestorNativeBridge.nativeRun\nelf_entry=0x1a73c0\n' \
+            "$GITHUB_SHA" "$NDK_VERSION" > dist/build-info.txt
+          (cd dist && sha256sum libnativelib.so inject.js > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qtrace-trustattestor-arm64
+          path: dist/
+          if-no-files-found: error
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-build-log
+          path: build/native-build.log
+          if-no-files-found: ignore

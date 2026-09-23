@@ -26,9 +26,9 @@ struct logger{
 
 extern logger *_logger;
 
-void initLogger(size_t function_address);
+bool initLogger(size_t function_address);
 void deleteLogger();
-void writelog();
+bool writelog();
 void appendlog(const char* str);
 void appendlog_n(const char* str, size_t len);
 void appendlogendl();

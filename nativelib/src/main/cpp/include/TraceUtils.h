@@ -42,6 +42,9 @@ bool isValidAddress(uint64_t address) ;
 bool isAsciiPrintableString(const uint8_t* data, size_t length) ;
 // 使用 process_vm_readv 安全读取内存的函数
 bool safeReadMemory(uint64_t address, uint8_t* buffer, size_t length) ;
+bool safeReadCString(uint64_t address, std::string& output, size_t maxLength = 4096);
+bool safeReadBytes(uint64_t address, size_t requestedLength, std::vector<uint8_t>& output,
+                   size_t maxLength = 4096);
 
 // 确保内存范围已加载（单例模式）
 void ensureMemoryRangesLoaded() ;

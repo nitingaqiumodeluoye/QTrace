@@ -10,7 +10,7 @@
 
 extern const JNINativeInterface* pJFunc;
 extern JNIEnv * jniEnv;
-void initJni();
+bool initJni();
 void setup_jfunc(JNIEnv * jnienv);
 void enable_jni_trace_debug(bool enable);
 

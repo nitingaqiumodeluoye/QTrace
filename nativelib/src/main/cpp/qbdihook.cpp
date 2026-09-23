@@ -6,6 +6,8 @@
 #include "logger.h"
 #include "HookUtils.h"
 #include "jnitrace.h"
+#include "TraceUtils.h"
+#include <vector>
 
 QBDIHookData*  _g_hook_data = nullptr;
 
@@ -14,13 +16,24 @@ void hook_0x71DD54(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     size_t input = QBDI_GPR_GET(gprState,3);
     size_t len = QBDI_GPR_GET(gprState,4);
-    char* hex = bytes_to_hex_string((char*)input,len);
-    char* base64 = (char*) malloc(2 * len);
-    memset(base64,0,2*len);
-    base64_encode(base64,(uint8_t*)input,len);
-    LOGE("base64:src:%p,raw:%s,res:%s",input,hex,base64);
+    std::vector<uint8_t> data;
+    if (!safeReadBytes(input, len, data)) {
+        LOGW("base64 hook skipped unreadable input: %p, len: %zu", (void*)input, len);
+        return;
+    }
+    char* hex = bytes_to_hex_string(reinterpret_cast<char*>(data.data()), data.size());
+    const size_t base64Size = 4 * ((data.size() + 2) / 3) + 1;
+    char* base64 = (char*) malloc(base64Size);
+    if (hex == nullptr || base64 == nullptr) {
+        free(hex);
+        free(base64);
+        return;
+    }
+    memset(base64,0,base64Size);
+    base64_encode(base64,data.data(),data.size());
+    LOGE("base64:src:%p,raw:%s,res:%s",(void*)input,hex,base64);
     appendlogendl();
-    appendformat("base64:src:%p,raw:%s,res:%s",input,hex,base64);
+    appendformat("base64:src:%p,raw:%s,res:%s",(void*)input,hex,base64);
     appendlogendl();
     free(hex);
     free(base64);

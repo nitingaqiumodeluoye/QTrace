@@ -1,54 +1,149 @@
-function hookLoadLibrary () {
-  var f_dlopen = Module.findExportByName(null, "__loader_dlopen")
-  Interceptor.attach(f_dlopen, {
-    onEnter: function (args) {
-      this.soname = args[0].readCString()
-      this.find = false
-      //console.log("dlopen:" + this.soname)
-      if(this.soname.indexOf("libtiny") != -1)
-      {
-        this.find = true
+"use strict";
+
+// Frida 17.15+ injection script for QTrace.
+const TARGET_MODULE = "libTrustAttestor.so";
+const QTRACE_PATH = "/data/local/tmp/libnativelib.so";
+const RTLD_NOW = 2;
+
+let injectionStarted = false;
+let injectionSucceeded = false;
+const loaderListeners = [];
+
+function log(message) {
+  console.log("[QTrace] " + message);
+}
+
+function fail(message) {
+  console.error("[QTrace] " + message);
+}
+
+function findGlobalExport(symbolName) {
+  const address = Module.findGlobalExportByName(symbolName);
+  if (address === null) {
+    log("global export not found: " + symbolName);
+  }
+  return address;
+}
+
+function readLibraryPath(address) {
+  if (address === null || address.isNull()) {
+    return null;
+  }
+
+  try {
+    return address.readCString();
+  } catch (error) {
+    log("unable to read loader path: " + error);
+    return null;
+  }
+}
+
+function isTargetLibrary(path) {
+  if (path === null) {
+    return false;
+  }
+  return path === TARGET_MODULE || path.endsWith("/" + TARGET_MODULE);
+}
+
+function injectQTrace(reason) {
+  if (injectionSucceeded || injectionStarted) {
+    return injectionSucceeded;
+  }
+
+  injectionStarted = true;
+  try {
+    const dlopenAddress = Module.getGlobalExportByName("dlopen");
+    const dlopen = new NativeFunction(
+      dlopenAddress,
+      "pointer",
+      ["pointer", "int"]
+    );
+    const path = Memory.allocUtf8String(QTRACE_PATH);
+    const handle = dlopen(path, RTLD_NOW);
+
+    if (handle.isNull()) {
+      let detail = "unknown dlopen error";
+      const dlerrorAddress = Module.findGlobalExportByName("dlerror");
+      if (dlerrorAddress !== null) {
+        const dlerror = new NativeFunction(dlerrorAddress, "pointer", []);
+        const errorPointer = dlerror();
+        if (!errorPointer.isNull()) {
+          detail = errorPointer.readCString();
+        }
       }
-    },
-    onLeave: function (retval) {
-        if(this.find)
-        {
-            inject()
-        }
+      throw new Error(detail);
     }
-  })
 
-  var f_android_dlopen_ext_base = Module.findExportByName(null, "android_dlopen_ext")
-  Interceptor.attach(f_android_dlopen_ext_base, {
-    onEnter: function (args) {
-      this.soname = args[0].readCString()
-      this.find = false
-      //console.log("android_dlopen_ext:" + this.soname)
-        if(this.soname.indexOf("libtiny") != -1)
-        {
-          this.find = true
-        }
+    injectionSucceeded = true;
+    log("loaded " + QTRACE_PATH + " after " + reason + ", handle=" + handle);
+    return true;
+  } catch (error) {
+    fail("injection failed after " + reason + ": " + error);
+    return false;
+  } finally {
+    injectionStarted = false;
+  }
+}
+
+function installLoaderHook(symbolName) {
+  const address = findGlobalExport(symbolName);
+  if (address === null) {
+    return false;
+  }
+
+  const listener = Interceptor.attach(address, {
+    onEnter(args) {
+      this.targetPath = readLibraryPath(args[0]);
+      this.isTarget = isTargetLibrary(this.targetPath);
     },
-    onLeave: function (retval) {
-        if(this.find)
-        {
-            inject()
-        }
+
+    onLeave(retval) {
+      if (!this.isTarget) {
+        return;
+      }
+      if (retval.isNull()) {
+        fail(symbolName + " failed to load " + this.targetPath);
+        return;
+      }
+      injectQTrace(symbolName + "(" + this.targetPath + ")");
     }
-  })
+  });
+
+  loaderListeners.push(listener);
+  log("hooked " + symbolName + " at " + address);
+  return true;
 }
 
-function inject () {
-  var dlopenPtr = Module.findExportByName(null, 'dlopen');
-  var dlopen = new NativeFunction(dlopenPtr, 'pointer', ['pointer', 'int']);
-  var soPath = "/data/local/tmp/libnativelib.so"; // trace 模块路径
-  var soPathPtr = Memory.allocUtf8String(soPath);
-  console.log("inject libnativelib.so")
-  dlopen(soPathPtr, 2);
+function main() {
+  log("Frida " + Frida.version + ", waiting for " + TARGET_MODULE);
+
+  const loaded = Process.findModuleByName(TARGET_MODULE);
+  if (loaded !== null) {
+    log(TARGET_MODULE + " is already loaded at " + loaded.base);
+    injectQTrace("existing module");
+    return;
+  }
+
+  let hookCount = 0;
+  if (installLoaderHook("__loader_dlopen")) {
+    hookCount += 1;
+  }
+  if (installLoaderHook("android_dlopen_ext")) {
+    hookCount += 1;
+  }
+  if (hookCount === 0 && installLoaderHook("dlopen")) {
+    hookCount += 1;
+  }
+
+  if (hookCount === 0) {
+    throw new Error("no supported loader export was found");
+  }
 }
 
-function attachInject () {
-  inject()
-}
-
-setImmediate(hookLoadLibrary);
+setImmediate(function () {
+  try {
+    main();
+  } catch (error) {
+    fail("fatal error: " + error + (error.stack ? "\n" + error.stack : ""));
+  }
+});
