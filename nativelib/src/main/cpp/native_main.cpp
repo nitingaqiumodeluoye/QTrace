@@ -212,8 +212,6 @@ static void tryInstallTargetHook(const MapItemInfo& soinfo)
         return;
     }
     {
-        if (initJni()) addJNItrace();
-        else LOGW("JNI trace disabled because JNIEnv initialization failed");
         initLibcTrace();
         addLibctrace();
         initHookData();
@@ -243,6 +241,9 @@ static void tryInstallTargetHook(const MapItemInfo& soinfo)
 void trace()
 {
     config();
+    // Capture ART's table before xfinject unlinks the payload's soinfo.
+    if (initJni()) addJNItrace();
+    else LOGW("JNI trace disabled because JNIEnv initialization failed");
     // The bundled static ShadowHook omits sh_linker_init(): dl-init callbacks
     // can register successfully without any events. Use address hooks instead.
     installLoaderHooks();

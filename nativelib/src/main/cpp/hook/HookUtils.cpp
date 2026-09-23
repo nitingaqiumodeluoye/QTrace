@@ -614,9 +614,9 @@ char* getPrivatePath(){
     if (privatePath[0] != 0 ){
         return privatePath;
     }
-    // 使用应用私有files目录，避免权限问题
-    snprintf(privatePath, sizeof(privatePath), "%s%s%s",
-             "/storage/emulated/0/Android/data/", getAppName(), "/files/");
+    // Internal app storage is writable without scoped-storage directory setup.
+    snprintf(privatePath, sizeof(privatePath), "/data/user/%u/%s/files/",
+             static_cast<unsigned>(getuid() / 100000), getAppName());
     LOGI("Using private path: %s", privatePath);
     return privatePath;
 }

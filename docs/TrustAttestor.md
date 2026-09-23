@@ -49,13 +49,14 @@ QTrace 构造函数对 linker 的 `__loader_dlopen` / `__loader_android_dlopen_e
 #!/system/bin/sh
 /data/local/tmp/karinaInject \
   -pkg com.lingqing.trustattestor \
-  -process-name com.lingqing.trustattestor \
   -lib /data/local/tmp/libnativelib.so \
   -debug -log-file /data/local/tmp/xfinject-qtrace.log
 ```
 
+使用默认 UID 选择：设备上观察到主进程 cmdline 被改为探针服务名称，`-process-name` 精确过滤可能误拒主进程。JNI 表在注入构造阶段获取，防止载荷被 xfinject 摘链后 `dlsym(RTLD_DEFAULT, ...)` 失败。trace 写入应用内部存储，导出需要 root。
+
 使用 `adb shell su -c "sh /data/local/tmp/run-qtrace.sh"` 执行该脚本（Git Bash 加 `MSYS_NO_PATHCONV=1`）。无需同时运行 `inject.js`。预期 QTrace logcat 先出现 `waiting for libTrustAttestor.so load (linker entry hooks)`，目标加载后出现 `nativeRun hook installed`。CI 仅验证构建，真机效果仍需确认。
 
-看到 QTrace 输出 `TrustAttestorNativeBridge.nativeRun: load_bias=..., ELF=0x1a73c0, entry=...` 后，在应用内触发扫描。日志输出到 `/storage/emulated/0/Android/data/com.lingqing.trustattestor/files/trace_logs/qbdi_*` 文件，完整路径由 logcat 输出。attach 模式只捕获安装 hook 后的调用；已经结束的扫描需要重新触发。
+看到 QTrace 输出 `TrustAttestorNativeBridge.nativeRun: load_bias=..., ELF=0x1a73c0, entry=...` 后，在应用内触发扫描。日志输出到 `/data/user/0/com.lingqing.trustattestor/files/trace_logs/qbdi_*` 文件，完整路径由 logcat 输出。attach 模式只捕获安装 hook 后的调用；已经结束的扫描需要重新触发。
 
 此目标覆盖整个 nativeRun，不仅是 L2。日志保留现有 GumTrace / trace-ui 格式及 JNI、libc 参数注解。
