@@ -114,7 +114,8 @@ static size_t findDuAnonRegion()
         if (sscanf(line, "%lx-%lx %4s %lx %*s %*s %4095[^\n]",
                    &start, &end, perms, &off, path) < 4) continue;
         /* 只要可执行 + 匿名 (无路径) + 大小约 0xb000 (44K), 容差 8K~1M */
-        if (perms[0] != 'r' || perms[3] != 'x') continue;
+        /* perms 如 "r-xp": [0]=r [1]=- [2]=x [3]=p */
+        if (perms[0] != 'r' || perms[2] != 'x') continue;
         if (path[0] != '\0') continue;
         size_t size = end - start;
         if (size < 0x8000 || size > 0x100000) continue;

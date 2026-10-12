@@ -1,0 +1,5 @@
+commit=2df4d673f9317ba10bdfde19a845d4594ca668a4
+ndk=27.2.12479018
+abi=arm64-v8a
+target=du_anon+0x774 (sg.ra JNI)
+elf_entry=0x774
