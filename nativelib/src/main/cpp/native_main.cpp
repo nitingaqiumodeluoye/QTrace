@@ -217,6 +217,8 @@ static bool safeMemRead(size_t addr, void* buf, size_t len)
  * 4) 挂 hook_and_trace_arg8 到 JNI_OnLoad; 首次调用时 trace 一次并卸载。
  */
 static const size_t GVM_JNI_ONLOAD_OFF = 0x4104;
+/* IL 共享入口(IV/IZ/IB/IC/IS/II/IJ/IL 同址), 相对解密后匿名段起点 */
+static const size_t GVM_IL_OFF = 0xc7a8;
 static std::atomic<bool> gvmInstalled{false};
 typedef void* (*dlopen_ext_fn)(const char*, int, const void*);
 static dlopen_ext_fn ori_dlopen_ext = nullptr;
@@ -304,20 +306,23 @@ static void installGvmJniOnLoadTrace(size_t gvmBase)
     LOGI("gvm: base=%p JNI_OnLoad=%p region=[%p,%p)", (void*)gvmBase, (void*)jniOnLoad,
          (void*)regionBase, (void*)regionEnd);
 
+    /* 挂在 IL 共享入口(不是 JNI_OnLoad): hook_and_trace_arg8 入口用 JNI 判断 id==466,
+     * 命中时以 IL 入口为 QBDI 起点 trace 一次。target = IL 入口 - 段起点。 */
+    size_t ilEntry = regionBase + GVM_IL_OFF;
     _g_trace_data = new g_trace_data();
     _g_trace_data->base = regionBase;
     _g_trace_data->start = regionBase;
     _g_trace_data->end = regionEnd;
-    _g_trace_data->target = jniOnLoad - regionBase;
-    set_trace_module_name("gamevmp_onload");
+    _g_trace_data->target = GVM_IL_OFF;
+    set_trace_module_name("gamevmp_il");
 
-    _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)jniOnLoad,
+    _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)ilEntry,
                                                         (void*)(hook_and_trace_arg8),
                                                         (void**)&ori_arg8);
     if (_g_trace_data->hooktask != nullptr) {
-        LOGI("gvm: JNI_OnLoad hook installed @ %p", (void*)jniOnLoad);
+        LOGI("gvm: IL entry hook installed @ %p (id==466 trace)", (void*)ilEntry);
     } else {
-        LOGE("gvm: failed to hook JNI_OnLoad @ %p", (void*)jniOnLoad);
+        LOGE("gvm: failed to hook IL entry @ %p", (void*)ilEntry);
         gvmInstalled.store(false);
     }
 }

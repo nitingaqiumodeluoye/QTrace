@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include <cstring>
 #include <sstream>
 #include <string>
@@ -186,27 +187,92 @@ size_t trace(size_t regs[31])
     return qbdi_retval;
 }
 
+/* ===== IL(466) 判断 =====
+ * IL 的 Object[] 首元素是 Integer(id)。入口用 JNI 读取并判断 id==466。
+ * 缓存: Integer 类为全局引用(局部引用只在本次 native 调用内有效); intValue 为 jmethodID。
+ * 每次调用都会做 JNI, 命中 466 后 trace 一次并卸挂钩, 之后无开销。 */
+static jclass g_integerCls = nullptr;
+static jmethodID g_intValueMid = nullptr;
+static std::atomic<bool> g_idCacheReady{false};
+
+/* 获取 JavaVM(只查询一次) */
+static JavaVM* get_java_vm()
+{
+    static JavaVM* cached = nullptr;
+    if (cached) return cached;
+    typedef jint (*JNI_GetCreatedJavaVMs_t)(JavaVM**, jsize, jsize*);
+    auto getVMs = (JNI_GetCreatedJavaVMs_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+    if (!getVMs) return nullptr;
+    JavaVM* vm = nullptr;
+    jsize count = 0;
+    if (getVMs(&vm, 1, &count) != JNI_OK || count == 0) return nullptr;
+    cached = vm;
+    return cached;
+}
+
+static bool ensureIdCache(JNIEnv* env)
+{
+    if (g_idCacheReady.load()) return true;
+    jclass local = env->FindClass("java/lang/Integer");
+    if (env->ExceptionCheck() || !local) { env->ExceptionClear(); return false; }
+    jmethodID mid = env->GetMethodID(local, "intValue", "()I");
+    if (env->ExceptionCheck() || !mid) { env->ExceptionClear(); env->DeleteLocalRef(local); return false; }
+    jclass global = (jclass)env->NewGlobalRef(local);
+    env->DeleteLocalRef(local);
+    if (!global) return false;
+    g_integerCls = global;
+    g_intValueMid = mid;
+    g_idCacheReady.store(true);
+    return true;
+}
+
+/* 返回 true 表示 x2 数组首元素的 int 值为 466。任何失败都返回 false(透传)。 */
+static bool il_id_is_466(size_t x2)
+{
+    JNIEnv* env = nullptr;
+    JavaVM* vm = get_java_vm();
+    if (!vm) return false;
+    /* 当前线程的 JNIEnv(IL 在 GameVMP 调用线程上执行, 不能复用 initJni 里 Attach 的 env) */
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return false;
+    if (!ensureIdCache(env)) return false;
+
+    jobjectArray arr = (jobjectArray)x2;
+    jsize len = env->GetArrayLength(arr);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (len < 1) return false;
+    jobject e0 = env->GetObjectArrayElement(arr, 0);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (!e0) return false;
+
+    jboolean isInt = env->IsInstanceOf(e0, g_integerCls);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(e0); return false; }
+    if (!isInt) { env->DeleteLocalRef(e0); return false; }
+
+    jint v = env->CallIntMethod(e0, g_intValueMid);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(e0); return false; }
+    env->DeleteLocalRef(e0);
+    return v == 466;
+}
+
 size_t hook_and_trace_arg8(size_t x0,size_t x1,size_t x2,size_t x3,size_t x4,size_t x5,size_t x6,size_t x7)
 {
-    size_t regs[31] = {0};
-    save_regs(regs);
-    regs[0] = x0;
-    regs[1] = x1;
-    regs[2] = x2;
-    regs[3] = x3;
-    regs[4] = x4;
-    regs[5] = x5;
-    regs[6] = x6;
-    regs[7] = x7;
-    /* 得物: sg.ra 每请求调用多次, 全 trace 日志爆炸。
-     * 只 trace 第一次调用 (hook 在 trace() 内部已被卸下, 这里卸后不重装)。 */
     static std::atomic<bool> tracedOnce{false};
+    if (tracedOnce.load()) {
+        return ori_arg8(x0,x1,x2,x3,x4,x5,x6,x7);
+    }
+    if (!il_id_is_466(x2)) {
+        return ori_arg8(x0,x1,x2,x3,x4,x5,x6,x7);
+    }
     if (tracedOnce.exchange(true)) {
         return ori_arg8(x0,x1,x2,x3,x4,x5,x6,x7);
     }
-    size_t result = trace(regs);
-    /* 首次后不再重装 hook — 后续调用走原函数, 零开销 */
-    return result;
+
+    size_t regs[31] = {0};
+    save_regs(regs);
+    regs[0] = x0; regs[1] = x1; regs[2] = x2; regs[3] = x3;
+    regs[4] = x4; regs[5] = x5; regs[6] = x6; regs[7] = x7;
+    LOGE("gvm: IL id==466 hit, starting one-shot trace");
+    return trace(regs);
 }
 
 bool checkAndCallHook(QBDI::VM *vm, QBDI::GPRState *gprState,size_t addr,size_t lastaddr)
