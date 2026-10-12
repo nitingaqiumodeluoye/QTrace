@@ -320,7 +320,7 @@ static void installGvmJniOnLoadTrace(size_t gvmBase)
                                                         (void*)(hook_and_trace_arg8),
                                                         (void**)&ori_arg8);
     if (_g_trace_data->hooktask != nullptr) {
-        LOGI("gvm: IL entry hook installed @ %p (id==510 trace)", (void*)ilEntry);
+        LOGI("gvm: IL entry hook installed @ %p (id==511 trace)", (void*)ilEntry);
     } else {
         LOGE("gvm: failed to hook IL entry @ %p", (void*)ilEntry);
         gvmInstalled.store(false);

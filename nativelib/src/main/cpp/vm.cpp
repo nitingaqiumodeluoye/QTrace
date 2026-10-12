@@ -189,10 +189,10 @@ size_t trace(size_t regs[31])
 
 /* ===== IL(id) 判断 =====
  * IL 的 Object[] 首元素是 Integer(id)。入口用 JNI 读取并判断目标 id。
- * 目标 id 由 GVM_TARGET_ID 指定: 510 = com.shizhuang.duapp.common.net.ncl.ms.e(签名/dhw 计算)
+ * 目标 id 由 GVM_TARGET_ID 指定: 511 = com.shizhuang.duapp.common.net.ncl.ms.f(签名/dhw 计算; 510 为 ms.e, 内部转调 511)
  * 缓存: Integer 类为全局引用(局部引用只在本次 native 调用内有效); intValue 为 jmethodID。
  * 每次调用都会做 JNI, 命中 466 后 trace 一次并卸挂钩, 之后无开销。 */
-static const int GVM_TARGET_ID = 510;   /* ms.e: (Z,HttpUrl,HashMap,J,String)->String 即 dhw */
+static const int GVM_TARGET_ID = 511;   /* ms.f: (Z,HttpUrl,HashMap,J,String,scu$a)->String; ms.e 内部转调 ms.f */
 static jclass g_integerCls = nullptr;
 static jmethodID g_intValueMid = nullptr;
 static std::atomic<bool> g_idCacheReady{false};
