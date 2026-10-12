@@ -11,6 +11,8 @@
 #include <vector>
 #include <sys/uio.h>
 #include <errno.h>
+#include <atomic>
+#include <cstdint>
 #include "vm.h"
 #include "HookUtils.h"
 #include "qbdihook.h"
@@ -153,7 +155,7 @@ static size_t findDuAnonRegion(size_t* entryOffsetOut)
 void config()
 {
     /* 目标是匿名区, libname/libpath 不用于定位 */
-    libname = "du_anon";
+    libname = "libGameVMP.so";
     trace_func = 0;  /* 动态: findDuAnonRegion 扫描后覆盖 */
 
     //trace buffer 累计多少字节往本地写一次。设置为0表示每trace一条指令就写入本地
@@ -207,6 +209,159 @@ static bool safeMemRead(size_t addr, void* buf, size_t len)
     return false;
 }
 
+/* ===== GameVMP JNI_OnLoad trace (QTrace 内部实现) =====
+ * 1) shadowhook 挂 android_dlopen_ext。
+ * 2) 路径含 libGameVMP.so 且返回成功:base = 模块基址, JNI_OnLoad = base + 0x4104(IDA 偏移,运行时已验证)。
+ * 3) JNI_OnLoad 所在的匿名 r-x 段作为 QBDI 插桩范围; target = JNI_OnLoad - 段基址,
+ *    使 trace() 内 start + target == JNI_OnLoad。
+ * 4) 挂 hook_and_trace_arg8 到 JNI_OnLoad; 首次调用时 trace 一次并卸载。
+ */
+static const size_t GVM_JNI_ONLOAD_OFF = 0x4104;
+static std::atomic<bool> gvmInstalled{false};
+typedef void* (*dlopen_ext_fn)(const char*, int, const void*);
+static dlopen_ext_fn ori_dlopen_ext = nullptr;
+
+static size_t anonRegionOf(size_t addr, size_t* endOut)
+{
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return 0;
+    char* line = nullptr; size_t len = 0; size_t result = 0;
+    while (getline(&line, &len, fp) != -1) {
+        size_t s = 0, e = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %4s", &s, &e, perms) < 3) continue;
+        if (addr >= s && addr < e) {
+            if (strchr(line, '/') == nullptr && perms[0] == 'r' && perms[2] == 'x') {
+                result = s;
+                if (endOut) *endOut = e;
+            }
+            break;
+        }
+    }
+    free(line);
+    fclose(fp);
+    return result;
+}
+
+/* JNI_OnLoad 处必须是合法的函数序言(已知: sub sp,sp,#imm / stp x29,x30,[sp,#imm] / stp pre-index)。
+ * 段可能仍在 DT_INIT 解密中, 因此校验失败时由调用方重试。 */
+static bool looksLikePrologue(size_t addr)
+{
+    uint32_t w = 0;
+    if (!safeMemRead(addr, &w, sizeof(w))) return false;
+    if ((w & 0xff0003ffu) == 0xd10003ffu) return true;      /* sub sp, sp, #imm */
+    if ((w & 0xffc00000u) == 0xa9800000u) return true;      /* stp ..., [sp, #imm]! (pre-index) */
+    if ((w & 0xffc00000u) == 0xa9000000u) return true;      /* stp ..., [sp, #imm] */
+    return false;
+}
+
+static void installGvmJniOnLoadTrace(size_t gvmBase);
+
+/* 轮询直到 JNI_OnLoad 处出现合法序言, 最多 200 次 x 50ms */
+static void* gvm_wait_and_install(void* arg)
+{
+    size_t gvmBase = (size_t)arg;
+    for (int i = 0; i < 200; i++) {
+        usleep(50 * 1000);
+        size_t jniOnLoad = gvmBase + GVM_JNI_ONLOAD_OFF;
+        if (looksLikePrologue(jniOnLoad)) {
+            LOGI("gvm: prologue ok after %d polls", i);
+            gvmInstalled.store(false);
+            installGvmJniOnLoadTrace(gvmBase);
+            return nullptr;
+        }
+    }
+    LOGE("gvm: JNI_OnLoad prologue never appeared; giving up");
+    gvmInstalled.store(false);
+    return nullptr;
+}
+
+static void installGvmJniOnLoadTrace(size_t gvmBase)
+{
+    bool expected = false;
+    if (!gvmInstalled.compare_exchange_strong(expected, true)) return;
+
+    size_t jniOnLoad = gvmBase + GVM_JNI_ONLOAD_OFF;
+    if (!looksLikePrologue(jniOnLoad)) {
+        LOGW("gvm: no prologue at JNI_OnLoad %p yet; polling", (void*)jniOnLoad);
+        gvmInstalled.store(false);
+        pthread_t th;
+        if (pthread_create(&th, nullptr, gvm_wait_and_install, (void*)gvmBase) == 0) {
+            pthread_detach(th);
+        } else {
+            LOGE("gvm: pthread_create failed");
+        }
+        return;
+    }
+
+    size_t regionEnd = 0;
+    size_t regionBase = anonRegionOf(jniOnLoad, &regionEnd);
+    if (regionBase == 0) {
+        LOGE("gvm: JNI_OnLoad %p not in an anonymous r-x region", (void*)jniOnLoad);
+        gvmInstalled.store(false);
+        return;
+    }
+    LOGI("gvm: base=%p JNI_OnLoad=%p region=[%p,%p)", (void*)gvmBase, (void*)jniOnLoad,
+         (void*)regionBase, (void*)regionEnd);
+
+    _g_trace_data = new g_trace_data();
+    _g_trace_data->base = regionBase;
+    _g_trace_data->start = regionBase;
+    _g_trace_data->end = regionEnd;
+    _g_trace_data->target = jniOnLoad - regionBase;
+    set_trace_module_name("gamevmp_onload");
+
+    _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)jniOnLoad,
+                                                        (void*)(hook_and_trace_arg8),
+                                                        (void**)&ori_arg8);
+    if (_g_trace_data->hooktask != nullptr) {
+        LOGI("gvm: JNI_OnLoad hook installed @ %p", (void*)jniOnLoad);
+    } else {
+        LOGE("gvm: failed to hook JNI_OnLoad @ %p", (void*)jniOnLoad);
+        gvmInstalled.store(false);
+    }
+}
+
+static size_t gvmModuleBase()
+{
+    size_t base = 0;
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return 0;
+    char* line = nullptr; size_t len = 0;
+    while (getline(&line, &len, fp) != -1) {
+        if (strstr(line, "libGameVMP.so") && base == 0) {
+            sscanf(line, "%lx", &base);
+        }
+    }
+    free(line);
+    fclose(fp);
+    return base;
+}
+
+static void* gvm_dlopen_ext(const char* filename, int flags, const void* extinfo)
+{
+    void* h = ori_dlopen_ext(filename, flags, extinfo);
+    if (filename && strstr(filename, "libGameVMP.so") && h != nullptr) {
+        size_t base = gvmModuleBase();
+        if (base != 0) {
+            LOGI("gvm: libGameVMP.so loaded, base=%p", (void*)base);
+            installGvmJniOnLoadTrace(base);
+        }
+    }
+    return h;
+}
+
+static void installDlopenExtHook()
+{
+    void* sym = shadowhook_hook_sym_name("libdl.so", "android_dlopen_ext",
+                                         (void*)gvm_dlopen_ext, (void**)&ori_dlopen_ext);
+    if (sym == nullptr) {
+        sym = shadowhook_hook_sym_name("linker64", "__loader_android_dlopen_ext",
+                                       (void*)gvm_dlopen_ext, (void**)&ori_dlopen_ext);
+    }
+    LOGI("gvm: dlopen_ext hook %s", sym ? "installed" : "FAILED");
+}
+
 void trace()
 {
     /*trace 配置*/
@@ -227,89 +382,8 @@ void trace()
     //添加目标so的hook点位
     addHooks();
 
-    /* 得物: 扫描匿名区找 sg.ra JNI 实现 */
-    size_t entryOff = 0;
-    size_t regionBase = findDuAnonRegion(&entryOff);
-    trace_func = entryOff;
-    if (regionBase != 0) {
-        /* 重扫 maps 拿区大小 */
-        FILE* fp = fopen("/proc/self/maps", "r");
-        size_t regionEnd = regionBase + 0xb000;
-        if (fp) {
-            char* line = nullptr; size_t len = 0;
-            while (getline(&line, &len, fp) != -1) {
-                size_t s = 0, e = 0;
-                if (sscanf(line, "%lx-%lx", &s, &e) == 2 && s == regionBase) {
-                    regionEnd = e; break;
-                }
-            }
-            free(line); fclose(fp);
-        }
-        LOGI("du anon region: base=%p end=%p entry=+%#zx",
-             (void*)regionBase, (void*)regionEnd, trace_func);
-        set_trace_module_name("du_anon");
-        _g_trace_data = new g_trace_data();
-        _g_trace_data->base = regionBase;
-        _g_trace_data->start = regionBase;
-        _g_trace_data->end = regionEnd;
-        _g_trace_data->target = trace_func;
-        _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)(regionBase + trace_func),
-                                                            (void*)(hook_and_trace_arg8),
-                                                            (void**)&ori_arg8);
-        if (_g_trace_data->hooktask != nullptr) {
-            LOGI("sg.ra entry hook installed @ %p", (void*)(regionBase + trace_func));
-        } else {
-            LOGE("failed to hook sg.ra entry");
-        }
-    } else {
-        /* 匿名区还没解包 (VM 晚解包) — 周期重试 */
-        LOGI("du anon region not found yet; install loader hook + retry timer");
-        /* 简单处理: 轮询线程, 每 2s 扫一次, 最多 120 次 */
-        pthread_t th;
-        static auto retryFn = [](void*) -> void* {
-            LOGI("retry thread started");
-            for (int i = 0; i < 120; i++) {
-                usleep(2 * 1000 * 1000);
-                size_t entryOff2 = 0;
-                size_t base = findDuAnonRegion(&entryOff2);
-                if (i % 5 == 0) LOGI("retry scan #%d: base=%p", i, (void*)base);
-                if (base != 0) {
-                    LOGI("du anon region found on retry: %p", (void*)base);
-                    /* 重新走 trace 安装流程 (递归一次) */
-                    /* 直接在此安装, 避免递归 */
-                    FILE* fp = fopen("/proc/self/maps", "r");
-                    size_t end = base + 0xb000;
-                    if (fp) {
-                        char* line = nullptr; size_t len = 0;
-                        while (getline(&line, &len, fp) != -1) {
-                            size_t s = 0, e = 0;
-                            if (sscanf(line, "%lx-%lx", &s, &e) == 2 && s == base) { end = e; break; }
-                        }
-                        free(line); fclose(fp);
-                    }
-                    set_trace_module_name("du_anon");
-                    _g_trace_data = new g_trace_data();
-                    _g_trace_data->base = base;
-                    _g_trace_data->start = base;
-                    _g_trace_data->end = end;
-                    _g_trace_data->target = entryOff2;
-                    _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)(base + entryOff2),
-                                                                        (void*)(hook_and_trace_arg8),
-                                                                        (void**)&ori_arg8);
-                    LOGI("retry hook installed: %p", _g_trace_data->hooktask);
-                    break;
-                }
-            }
-            return nullptr;
-        };
-        int prc = pthread_create(&th, nullptr, +[](void* arg) -> void* { return retryFn(arg); }, nullptr);
-        if (prc != 0) {
-            LOGE("retry pthread_create failed: %d", prc);
-        } else {
-            pthread_detach(th);
-            LOGI("retry thread launched");
-        }
-    }
+    /* GameVMP: 等待 libGameVMP.so 加载后,挂 JNI_OnLoad(见 installGvmJniOnLoadTrace) */
+    installDlopenExtHook();
 }
 
 void test()
