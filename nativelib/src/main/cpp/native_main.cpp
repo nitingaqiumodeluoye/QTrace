@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <cstring>
+#include <cctype>
 #include "vm.h"
 #include "HookUtils.h"
 #include "qbdihook.h"
@@ -113,6 +114,8 @@ static size_t findDuAnonRegion()
         char path[4096] = {0};
         if (sscanf(line, "%lx-%lx %4s %lx %*s %*s %4095[^\n]",
                    &start, &end, perms, &off, path) < 4) continue;
+        /* 匿名行尾部可能有空格被 [^\n] 吃进去 — 去尾部空白后判空 */
+        for (char* p = path + strlen(path); p > path && isspace((unsigned char)p[-1]); --p) p[-1] = '\0';
         /* 只要可执行 + 匿名 (无路径) + 大小约 0xb000 (44K), 容差 8K~1M */
         /* perms 如 "r-xp": [0]=r [1]=- [2]=x [3]=p */
         if (perms[0] != 'r' || perms[2] != 'x') continue;
