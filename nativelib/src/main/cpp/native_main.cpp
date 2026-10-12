@@ -257,6 +257,7 @@ void trace()
         }
         LOGI("du anon region: base=%p end=%p entry=+%#zx",
              (void*)regionBase, (void*)regionEnd, trace_func);
+        set_trace_module_name("du_anon");
         _g_trace_data = new g_trace_data();
         _g_trace_data->base = regionBase;
         _g_trace_data->start = regionBase;
@@ -296,6 +297,7 @@ void trace()
                         }
                         free(line); fclose(fp);
                     }
+                    set_trace_module_name("du_anon");
                     _g_trace_data = new g_trace_data();
                     _g_trace_data->base = base;
                     _g_trace_data->start = base;

@@ -29,6 +29,13 @@ g_trace_data* _g_trace_data = nullptr;
 int bufsize = 0x1000000;
 bool debugInsn = false;
 
+/* trace-ui GumTrace 模块名 — 由 native_main 安装时设置 */
+static const char* g_trace_module_name = "du_anon";
+void set_trace_module_name(const char* name) {
+    if (name && *name) g_trace_module_name = name;
+}
+static const char* trace_module_name() { return g_trace_module_name; }
+
 func_arg_8 ori_arg8{};
 
 
@@ -81,7 +88,14 @@ static void flushPending(QBDI::GPRState *gprState)
 {
     if (!pending.valid) return;
 
-    appendlog_n(pending.line, pending.lineLen);   // 上一条的 "asm [读]"
+    appendlog_n(pending.line, pending.lineLen);   // 上一条的 "[mod] abs!off asm ; 读"
+
+    /* 内存访问注解为 mem_r=/mem_w= 前缀 (内联在指令行尾, trace-ui 格式) */
+    if (pending.memLen > 0) {
+        /* memInfo 现在是 "mem_r=0x... mem_w=0x..." 空格分隔 */
+        appendlog(" ");
+        appendlog_n(pending.memInfo, pending.memLen);
+    }
 
     if (pending.numWrite > 0) {
         char wbuf[256];
@@ -92,14 +106,10 @@ static void flushPending(QBDI::GPRState *gprState)
                              pending.writeNames[i], v);
             if (woff >= (int)sizeof(wbuf)) { woff = sizeof(wbuf) - 1; break; }
         }
-        appendlog("\t => [");
+        appendlog("-> ");
         appendlog_n(wbuf, woff);
-        appendlog("]");
     }
     appendlogendl();
-    if (pending.memLen > 0) {
-        appendlog_n(pending.memInfo, pending.memLen);
-    }
     pending.valid = false;
 }
 static void save_regs(size_t* regs)
@@ -327,8 +337,11 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
     }
 
     int off = 0;
+    /* trace-ui GumTrace 格式: [模块名] 0x绝对地址!0x相对偏移 助记符 操作数; 读寄存器 mem_r/w=地址 -> 写寄存器 */
     off += snprintf(pending.line + off, sizeof(pending.line) - off,
-                    "0x%lx: %s", (instAnalysis->address - thiz->base), disasm);
+                    "[%s] 0x%lx!0x%lx %s", trace_module_name(),
+                    (size_t)instAnalysis->address,
+                    (instAnalysis->address - thiz->base), disasm);
 
     char rbuf[256];
     int roff = 0;
@@ -347,12 +360,11 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
         }
     }
     if (any) {
-        off += snprintf(pending.line + off, sizeof(pending.line) - off, "\t[");
+        off += snprintf(pending.line + off, sizeof(pending.line) - off, "; ");
         // 把读寄存器拼进 pending.line
         int copyLen = roff;
         if (off + copyLen >= (int)sizeof(pending.line)) copyLen = sizeof(pending.line) - off - 2;
         if (copyLen > 0) { memcpy(pending.line + off, rbuf, copyLen); off += copyLen; }
-        off += snprintf(pending.line + off, sizeof(pending.line) - off, "]");
     }
 
     pending.lineLen = off;
@@ -432,16 +444,14 @@ QBDI::VMAction showMemoryAccess(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FP
     const auto& accesses = vm->getInstMemoryAccess();   // 只调一次
     for (const auto &acc : accesses)
     {
-        const char* tag = (acc.type == MEMORY_READ)  ? "mem[r]"
-                                                     : (acc.type == MEMORY_WRITE) ? "mem[w]"
-                                                                                  : "mem[rw]";
+        const char* tag = (acc.type == MEMORY_READ)  ? "mem_r"
+                                                     : (acc.type == MEMORY_WRITE) ? "mem_w"
+                                                                                  : "mem_rw";
         pending.memLen += snprintf(pending.memInfo + pending.memLen,
                                    sizeof(pending.memInfo) - pending.memLen,
-                                   "%s: 0x%" PRIx64 " size: %u value: 0x%" PRIx64 "\n",
+                                   "%s=0x%" PRIx64 " ",
                                    tag,
-                                   (uint64_t)acc.accessAddress,
-                                   (unsigned)acc.size,
-                                   (uint64_t)acc.value);
+                                   (uint64_t)acc.accessAddress);
         if (pending.memLen >= (int)sizeof(pending.memInfo)) {
             pending.memLen = sizeof(pending.memInfo) - 1;
             break;

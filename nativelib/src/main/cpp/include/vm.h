@@ -39,6 +39,7 @@ extern g_trace_data* _g_trace_data;
 extern int bufsize ;
 extern bool debugInsn;
 void setBufferSize(int);
+void set_trace_module_name(const char* name);
 void enableDebugInsn(bool);
 
 void sync_regs(size_t* regs,size_t pc,QBDI::GPRState* qbdi_state);

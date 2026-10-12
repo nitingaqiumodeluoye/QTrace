@@ -10,7 +10,7 @@ ELF Header:
   Version:                           0x1
   Entry point address:               0x0
   Start of program headers:          64 (bytes into file)
-  Start of section headers:          57552904 (bytes into file)
+  Start of section headers:          57555424 (bytes into file)
   Flags:                             0x0
   Size of this header:               64 (bytes)
   Size of program headers:           56 (bytes)
@@ -18,7 +18,7 @@ ELF Header:
   Size of section headers:           64 (bytes)
   Number of section headers:         36
   Section header string table index: 34
-Dynamic section at offset 0x616e30 contains 29 entries:
+Dynamic section at offset 0x617030 contains 29 entries:
   Tag                Type           Name/Value
   0x0000000000000001 (NEEDED)       Shared library: [libandroid.so]
   0x0000000000000001 (NEEDED)       Shared library: [liblog.so]
@@ -34,16 +34,16 @@ Dynamic section at offset 0x616e30 contains 29 entries:
   0x000000006ffffff9 (RELACOUNT)    12837
   0x0000000000000017 (JMPREL)       0x87ea0
   0x0000000000000002 (PLTRELSZ)     17088 (bytes)
-  0x0000000000000003 (PLTGOT)       0x618a40
+  0x0000000000000003 (PLTGOT)       0x618c40
   0x0000000000000014 (PLTREL)       RELA
   0x0000000000000006 (SYMTAB)       0x2f8
   0x000000000000000b (SYMENT)       24 (bytes)
   0x0000000000000005 (STRTAB)       0x149a0
   0x000000000000000a (STRSZ)        114934 (bytes)
   0x000000006ffffef5 (GNU_HASH)     0x10ad8
-  0x0000000000000019 (INIT_ARRAY)   0x617db0
+  0x0000000000000019 (INIT_ARRAY)   0x617fb0
   0x000000000000001b (INIT_ARRAYSZ) 128 (bytes)
-  0x000000000000001a (FINI_ARRAY)   0x617da0
+  0x000000000000001a (FINI_ARRAY)   0x617fa0
   0x000000000000001c (FINI_ARRAYSZ) 16 (bytes)
   0x000000006ffffff0 (VERSYM)       0xf640
   0x000000006ffffffe (VERNEED)      0x10a88
