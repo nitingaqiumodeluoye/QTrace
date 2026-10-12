@@ -217,7 +217,6 @@ void trace()
         _g_trace_data->start = regionBase;
         _g_trace_data->end = regionEnd;
         _g_trace_data->target = trace_func;
-        _g_trace_data->module_name = "du_anon";
         _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)(regionBase + trace_func),
                                                             (void*)(hook_and_trace_arg8),
                                                             (void**)&ori_arg8);
@@ -255,7 +254,6 @@ void trace()
                     _g_trace_data->start = base;
                     _g_trace_data->end = end;
                     _g_trace_data->target = DU_ENTRY_OFFSET;
-                    _g_trace_data->module_name = "du_anon";
                     _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)(base + DU_ENTRY_OFFSET),
                                                                         (void*)(hook_and_trace_arg8),
                                                                         (void**)&ori_arg8);
