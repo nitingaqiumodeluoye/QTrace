@@ -5,6 +5,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cassert>
+#include <atomic>
 #include <sstream>
 #include <unordered_map>
 #include <sys/uio.h>
@@ -187,19 +188,15 @@ size_t hook_and_trace_arg8(size_t x0,size_t x1,size_t x2,size_t x3,size_t x4,siz
     regs[5] = x5;
     regs[6] = x6;
     regs[7] = x7;
-    //根据参数过滤条件
-    /*if(x0 == 1)
-    {
+    /* 得物: sg.ra 每请求调用多次, 全 trace 日志爆炸。
+     * 只 trace 第一次调用 (hook 在 trace() 内部已被卸下, 这里卸后不重装)。 */
+    static std::atomic<bool> tracedOnce{false};
+    if (tracedOnce.exchange(true)) {
         return ori_arg8(x0,x1,x2,x3,x4,x5,x6,x7);
     }
-    else
-    {*/
-        size_t result = trace(regs);
-        _g_trace_data->hooktask = shadowhook_hook_func_addr((void*)(_g_trace_data->start + _g_trace_data->target),
-                                                            (void*)(hook_and_trace_arg8),
-                                                            (void**)&ori_arg8);
-        return result;
-    //}
+    size_t result = trace(regs);
+    /* 首次后不再重装 hook — 后续调用走原函数, 零开销 */
+    return result;
 }
 
 bool checkAndCallHook(QBDI::VM *vm, QBDI::GPRState *gprState,size_t addr,size_t lastaddr)
@@ -489,12 +486,11 @@ QBDI::VM vm::init(size_t start,size_t end)
     cid = qvm.addMemAccessCB(MEMORY_READ_WRITE, showMemoryAccess, this);
     assert(cid != QBDI::INVALID_EVENTID);
 
-    bool ret = qvm.addInstrumentedModuleFromAddr(reinterpret_cast<QBDI::rword>(start));
-    if(!ret)
-    {
-        LOGE("init vm fail");
-        assert(ret == true);
-    }
-    LOGE("init vm success");
+    /* 匿名区 (ijiami VM 解包代码) 不是 ELF 模块, addInstrumentedModuleFromAddr
+     * 会失败 — 直接按地址范围指杆。范围外的跨模块调用 (libc/jni/art) 仍会执行,
+     * 只是不记指令; JNI/libc trace 钩子仍能捕获边界。 */
+    qvm.addInstrumentedRange(reinterpret_cast<QBDI::rword>(start),
+                             reinterpret_cast<QBDI::rword>(end));
+    LOGE("init vm success (range %p-%p)", (void*)start, (void*)end);
     return qvm;
 }
