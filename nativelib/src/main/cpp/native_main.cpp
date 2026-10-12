@@ -9,6 +9,8 @@
 #include <cstring>
 #include <cctype>
 #include <vector>
+#include <sys/uio.h>
+#include <errno.h>
 #include "vm.h"
 #include "HookUtils.h"
 #include "qbdihook.h"
@@ -186,14 +188,33 @@ void init_shadowhook()
 
 static bool safeMemRead(size_t addr, void* buf, size_t len)
 {
-    /* 通过 /proc/self/mem 读, 避免直接解引用崩;/proc/self/maps 同权限 */
+    /* /proc/self/mem 可能短读 — 循环补齐; 仍失败则用 process_vm_readv 兜底 */
     FILE* fp = fopen("/proc/self/mem", "rb");
-    if (!fp) return false;
-    bool ok = false;
-    if (fseeko(fp, (off_t)addr, SEEK_SET) == 0)
-        ok = (fread(buf, 1, len, fp) == len);
-    fclose(fp);
-    return ok;
+    if (fp) {
+        if (fseeko(fp, (off_t)addr, SEEK_SET) == 0) {
+            size_t got = 0;
+            while (got < len) {
+                size_t n = fread((uint8_t*)buf + got, 1, len - got, fp);
+                if (n == 0) break;
+                got += n;
+            }
+            fclose(fp);
+            if (got == len) return true;
+            LOGW("mem read short: %p want=%zu got=%zu", (void*)addr, len, got);
+        } else {
+            fclose(fp);
+            LOGW("mem seek fail: %p errno=%d", (void*)addr, errno);
+        }
+    } else {
+        LOGW("open /proc/self/mem fail: errno=%d", errno);
+    }
+    /* process_vm_readv 兜底 */
+    struct iovec local { (void*)buf, len };
+    struct iovec remote { (void*)addr, len };
+    ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (n == (ssize_t)len) return true;
+    LOGW("process_vm_readv fail: %p ret=%zd errno=%d", (void*)addr, n, errno);
+    return false;
 }
 
 void trace()
