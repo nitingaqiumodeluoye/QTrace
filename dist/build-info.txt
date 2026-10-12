@@ -1,4 +1,4 @@
-commit=14b6b4f67631ca97cae577d9c2037f00df0f65d6
+commit=6e9b8ac5e3ec62569eac1c17bb58055dbd274142
 ndk=27.2.12479018
 abi=arm64-v8a
 target=du_anon+0x774 (sg.ra JNI)

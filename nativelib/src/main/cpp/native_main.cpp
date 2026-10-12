@@ -82,22 +82,24 @@ string libpath;
 /*需要trace的函数地址*/
 size_t trace_func = 0;
 
-/* ===== 得物 dhw 专用配置 =====
- * 目标不在任何 so 文件里：sg.ra 的 JNI 实现在 ijiami VM 运行时解包的
- * 匿名 r-x 区（上次 dump 基址 0x76ba42e000，大小 0xb000）。
- * 定位方式：扫描 /proc/self/maps 的匿名可执行区，匹配 AES S-box 特征
- * （区+0x7174 处的 16 字节标准 AES S-box 前缀）。
- * trace_func = 0x774 = sg.ra JNI 实现（stp x26,x25 prologue,
- *   内部 GetStringUTFChars/GetArrayLength/GetByteArrayElements +
- *   b64 解码 + AES + 组装 52B 返回值）。
+/* ===== 得物 dhw 专用配置 (v2: 目标 = sg.ra 本体) =====
+ * sg.ra JNI 实现在 ijiami VM 运行时解包的 340K (0x55000) 匿名 r-x 区
+ * (RegisterNatives 实测: ra → 区+0x1228, fa → 区+0x88ac)。
+ * 定位方式：扫描 /proc/self/maps 的匿名可执行区，匹配 sg.ra 入口 40B 特征
+ * (40B 足以在区内唯一定位; 前 32B prologue 与 0x1cad0/0x325e4 同构,
+ *  0x20 处 stur w10 / mrs 后续指令不同)。
  */
-static const uint8_t DU_SBOX_SIG[16] = {
-    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,
-    0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76
-};
-/* 偏移随会话漂移 (上次 0x7174/0x774, 本次 0x81b4/0x177f) — 全区间搜索 */
-static const uint8_t DU_ENTRY_SIG[12] = {      /* 入口 12 字节校验 */
-    0xfa,0x67,0xbb,0xa9,0xf8,0x5f,0x01,0xa9,0xf6,0x57,0x02,0xa9
+static const uint8_t DU_ENTRY_SIG[40] = {
+    0xff,0x43,0x05,0xd1,                   /* sub sp, sp, 0x150 */
+    0xfd,0x7b,0x0f,0xa9,                   /* stp fp, lr, [sp,0xf0] */
+    0xfc,0x6f,0x10,0xa9,                   /* stp x28,x27,[sp,0x100] */
+    0xfa,0x67,0x11,0xa9,                   /* stp x26,x25,[sp,0x110] */
+    0xf8,0x5f,0x12,0xa9,                   /* stp x24,x23,[sp,0x120] */
+    0xf6,0x57,0x13,0xa9,                   /* stp x22,x21,[sp,0x130] */
+    0xf4,0x4f,0x14,0xa9,                   /* stp x20,x19,[sp,0x140] */
+    0xfd,0xc3,0x03,0x91,                   /* add fp, sp, 0xf0 */
+    0x4a,0xd0,0x3b,0xd5,                   /* mrs x10, TPIDR_EL0 */
+    0xea,0x03,0x00,0xf9                    /* str x10, [sp] */
 };
 
 static bool safeMemRead(size_t addr, void* buf, size_t len);
@@ -126,19 +128,9 @@ static size_t findDuAnonRegion(size_t* entryOffsetOut)
         size_t size = end - start;
         if (size < 0x4000 || size > 0x100000) continue;
 
-        /* 读整个区做双特征全区间搜索 (S-box + JNI 入口) */
+        /* 读整个区做全区间搜索 sg.ra 入口 40B 特征 */
         std::vector<uint8_t> buf(size);
         if (!safeMemRead(start, buf.data(), size)) continue;
-        /* 搜索 AES S-box 特征 */
-        size_t sb = 0;
-        bool foundSb = false;
-        for (size_t i = 0; i + sizeof(DU_SBOX_SIG) <= size; i += 4) {
-            if (memcmp(buf.data() + i, DU_SBOX_SIG, sizeof(DU_SBOX_SIG)) == 0) {
-                sb = i; foundSb = true; break;
-            }
-        }
-        if (!foundSb) continue;
-        /* 搜索 sg.ra JNI 入口 12B 特征 */
         size_t ent = 0;
         bool foundEnt = false;
         for (size_t i = 0; i + sizeof(DU_ENTRY_SIG) <= size; i += 4) {
@@ -147,12 +139,10 @@ static size_t findDuAnonRegion(size_t* entryOffsetOut)
             }
         }
         if (!foundEnt) continue;
-        /* 入口必须在 S-box 之前 (JNI 桥在代码区, S-box 在数据区) */
-        if (ent >= sb) continue;
         if (entryOffsetOut) *entryOffsetOut = ent;
         result = start;
-        LOGI("du region match: base=%p size=%#zx sbox=+%#zx entry=+%#zx",
-             (void*)start, size, sb, ent);
+        LOGI("du sg.ra region match: base=%p size=%#zx entry=+%#zx",
+             (void*)start, size, ent);
         break;
     }
     free(line);
