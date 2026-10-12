@@ -187,10 +187,12 @@ size_t trace(size_t regs[31])
     return qbdi_retval;
 }
 
-/* ===== IL(466) 判断 =====
- * IL 的 Object[] 首元素是 Integer(id)。入口用 JNI 读取并判断 id==466。
+/* ===== IL(id) 判断 =====
+ * IL 的 Object[] 首元素是 Integer(id)。入口用 JNI 读取并判断目标 id。
+ * 目标 id 由 GVM_TARGET_ID 指定: 510 = com.shizhuang.duapp.common.net.ncl.ms.e(签名/dhw 计算)
  * 缓存: Integer 类为全局引用(局部引用只在本次 native 调用内有效); intValue 为 jmethodID。
  * 每次调用都会做 JNI, 命中 466 后 trace 一次并卸挂钩, 之后无开销。 */
+static const int GVM_TARGET_ID = 510;   /* ms.e: (Z,HttpUrl,HashMap,J,String)->String 即 dhw */
 static jclass g_integerCls = nullptr;
 static jmethodID g_intValueMid = nullptr;
 static std::atomic<bool> g_idCacheReady{false};
@@ -226,8 +228,8 @@ static bool ensureIdCache(JNIEnv* env)
     return true;
 }
 
-/* 返回 true 表示 x2 数组首元素的 int 值为 466。任何失败都返回 false(透传)。 */
-static bool il_id_is_466(size_t x2)
+/* 返回 true 表示 x2 数组首元素的 int 值为 GVM_TARGET_ID。任何失败都返回 false(透传)。 */
+static bool il_id_matches(size_t x2)
 {
     JNIEnv* env = nullptr;
     JavaVM* vm = get_java_vm();
@@ -251,7 +253,7 @@ static bool il_id_is_466(size_t x2)
     jint v = env->CallIntMethod(e0, g_intValueMid);
     if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(e0); return false; }
     env->DeleteLocalRef(e0);
-    return v == 466;
+    return v == GVM_TARGET_ID;
 }
 
 size_t hook_and_trace_arg8(size_t x0,size_t x1,size_t x2,size_t x3,size_t x4,size_t x5,size_t x6,size_t x7)
@@ -260,7 +262,7 @@ size_t hook_and_trace_arg8(size_t x0,size_t x1,size_t x2,size_t x3,size_t x4,siz
     if (tracedOnce.load()) {
         return ori_arg8(x0,x1,x2,x3,x4,x5,x6,x7);
     }
-    if (!il_id_is_466(x2)) {
+    if (!il_id_matches(x2)) {
         return ori_arg8(x0,x1,x2,x3,x4,x5,x6,x7);
     }
     if (tracedOnce.exchange(true)) {
@@ -271,7 +273,7 @@ size_t hook_and_trace_arg8(size_t x0,size_t x1,size_t x2,size_t x3,size_t x4,siz
     save_regs(regs);
     regs[0] = x0; regs[1] = x1; regs[2] = x2; regs[3] = x3;
     regs[4] = x4; regs[5] = x5; regs[6] = x6; regs[7] = x7;
-    LOGE("gvm: IL id==466 hit, starting one-shot trace");
+    LOGE("gvm: IL id==%d hit, starting one-shot trace", (int)GVM_TARGET_ID);
     return trace(regs);
 }
 
