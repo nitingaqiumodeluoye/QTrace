@@ -254,12 +254,13 @@ void trace()
         LOGI("du anon region not found yet; install loader hook + retry timer");
         /* 简单处理: 轮询线程, 每 2s 扫一次, 最多 120 次 */
         pthread_t th;
-        struct RetryCtx { };
         static auto retryFn = [](void*) -> void* {
+            LOGI("retry thread started");
             for (int i = 0; i < 120; i++) {
                 usleep(2 * 1000 * 1000);
                 size_t entryOff2 = 0;
                 size_t base = findDuAnonRegion(&entryOff2);
+                if (i % 5 == 0) LOGI("retry scan #%d: base=%p", i, (void*)base);
                 if (base != 0) {
                     LOGI("du anon region found on retry: %p", (void*)base);
                     /* 重新走 trace 安装流程 (递归一次) */
@@ -288,8 +289,13 @@ void trace()
             }
             return nullptr;
         };
-        pthread_create(&th, nullptr, +[](void* arg) -> void* { return retryFn(arg); }, nullptr);
-        pthread_detach(th);
+        int prc = pthread_create(&th, nullptr, +[](void* arg) -> void* { return retryFn(arg); }, nullptr);
+        if (prc != 0) {
+            LOGE("retry pthread_create failed: %d", prc);
+        } else {
+            pthread_detach(th);
+            LOGI("retry thread launched");
+        }
     }
 }
 
