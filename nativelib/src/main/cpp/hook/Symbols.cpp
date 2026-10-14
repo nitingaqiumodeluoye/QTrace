@@ -163,19 +163,27 @@ void parse_module(Module &m)
     LOGI("symbols: %s -> %zu syms", m.path.c_str(), m.syms.size());
 }
 
+// 查找包含 addr 的可执行映射对应的模块。
+// g_mappings 已按 start 升序，用二分（不是线性扫描）——
+// 本函数在**每条分支指令**上都可能被调用，而匿名区目标永远查不到，
+// 线性扫 400+ 个映射是纯浪费。
 const Module *module_for_addr(uint64_t addr, bool *need_parse, uint32_t *idx)
 {
-    for (const Mapping &mp : g_mappings) {
-        if (addr >= mp.start && addr < mp.end) {
-            const Module &m = g_modules[mp.module_idx];
-            if (!m.parsed) {
-                *need_parse = true;
-                *idx = mp.module_idx;
-            }
-            return &m;
-        }
+    auto it = std::upper_bound(g_mappings.begin(), g_mappings.end(), addr,
+                               [](uint64_t v, const Mapping &m) { return v < m.start; });
+    if (it == g_mappings.begin()) {
+        return nullptr;
     }
-    return nullptr;
+    --it;
+    if (addr < it->start || addr >= it->end) {
+        return nullptr;
+    }
+    const Module &m = g_modules[it->module_idx];
+    if (!m.parsed) {
+        *need_parse = true;
+        *idx = it->module_idx;
+    }
+    return &m;
 }
 
 } // namespace

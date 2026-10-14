@@ -622,6 +622,24 @@ static bool emit_symbol_call(const QBDI::InstAnalysis *ia, QBDI::GPRState *gprSt
     for (int i = 0; i < 8; ++i) {
         x[i] = (uint64_t)QBDI_GPR_GET(gprState, i);
     }
+
+    /* libc 的 syscall() 包装器：真正调用的系统调用号在 x0，
+     * 名字从号解析、参数整体左移一位（等价 GumTrace 的 FuncPrinter::syscall）。 */
+    if (strcmp(name, "syscall") == 0) {
+        const char *sc = syscall_name(x[0]);
+        if (sc == nullptr) {
+            return false;
+        }
+        uint64_t shifted[8];
+        for (int i = 0; i < 7; ++i) {
+            shifted[i] = x[i + 1];
+        }
+        shifted[7] = 0;
+        emit_call_begin(sc, shifted, syscall_argc(x[0], shifted));
+        known_func_emit_args(sc, shifted);
+        return true;
+    }
+
     // 未知符号按 GumTrace 的习惯打印 ()，已知函数才打印参数与解码结果
     int argc = known_func_argc(name);
     if (argc < 0) {
