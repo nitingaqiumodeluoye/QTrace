@@ -12,6 +12,9 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <cstring>
+#include <cstdio>
+#include <cinttypes>
+#include <cstddef>
 #include <sstream>
 #include <string>
 #include <QBDI/Callback.h>
@@ -73,16 +76,26 @@ uintptr_t inline get_current_x30() {
 // pending:暂存上一条指令待补全的信息
 struct PendingInst {
     bool valid = false;
-    char line[1024];
+    char line[4096];
     int  lineLen = 0;
-    int  writeRegs[8];
-    char writeNames[8][16];
+    /* 待补全的写寄存器（GPR 与 SIMD/FPR 混排，索引空间不同需区分） */
+    struct WriteReg {
+        uint8_t is_fpr;
+        uint8_t idx;
+        uint8_t size;      // 字节；GPR 固定 8，FPR 取 QBDI 的 op.size
+        char    name[12];  // 已按反汇编写法对齐（如 v0 / q1 / d2）
+    };
+    WriteReg writes[12];
     int  numWrite = 0;
     char memInfo[1024];      // 内存访问行(可能多条)
     int  memLen = 0;
-    char annot[4096];        // GumTrace 风格调用注解(call func/args/hexdump/jclass/jmethod)
+    char annot[8192];        // GumTrace 风格调用注解(call func/args/hexdump)
     int  annotLen = 0;
     bool hasCall = false;    // 该指令是否为已识别的调用(决定是否输出 ret)
+    /* JNI 调用的事后处理（返回值只有调用返回后才知道） */
+    bool isJniCall = false;
+    char jniName[48];
+    uint64_t jniPreArgs[8];
 };
 
 static PendingInst pending;
@@ -131,7 +144,121 @@ static void lower_reg_name(char *dst, size_t dst_size, const char *src) {
 // 输出顺序与 GumTrace 一致:
 //   [mod] abs!off asm; 读寄存器 mem_r/w=地址 -> 写寄存器
 //   call func: name(args) / argsN: ... / hexdump ... / ret: 0x...
-static void flushPending(QBDI::GPRState *gprState)
+/* SIMD/FPR 寄存器值：QBDI 的 FPRState 里 v0..v31 连续存放（16 字节 × 32）。
+ * 用 static_assert 锁住布局，避免 QBDI 升级后静默错位。 */
+static_assert(offsetof(QBDI::FPRState, v1) == 16, "QBDI FPRState layout changed (v1)");
+static_assert(offsetof(QBDI::FPRState, fpcr) == 32 * 16, "QBDI FPRState layout changed (fpcr)");
+
+// 128-bit 十六进制（无前导零，与 GumTrace 的 format_uint128_hex 一致）
+static void format_u128_hex(char *dst, size_t dst_size, __uint128_t v)
+{
+    uint64_t hi = (uint64_t)(v >> 64);
+    uint64_t lo = (uint64_t)v;
+    if (hi != 0) {
+        snprintf(dst, dst_size, "%" PRIx64 "%016" PRIx64, hi, lo);
+    } else {
+        snprintf(dst, dst_size, "%" PRIx64, lo);
+    }
+}
+
+// 取出第 idx 个 SIMD 寄存器值，按 size（字节）截断后格式化为十六进制
+static void simd_value_hex(char *dst, size_t dst_size,
+                           const QBDI::FPRState *fprState, int idx, uint8_t size)
+{
+    if (dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (fprState == nullptr || idx < 0 || idx >= 32) {
+        return;
+    }
+    __uint128_t raw = 0;
+    memcpy(&raw, reinterpret_cast<const uint8_t *>(fprState) + (size_t)idx * 16, sizeof(raw));
+    if (size == 0 || size > 16) {
+        size = 16;
+    }
+    if (size < 16) {
+        raw &= (((__uint128_t)1 << (size * 8)) - 1);
+    }
+    format_u128_hex(dst, dst_size, raw);
+}
+
+/* 反汇编文本里的 SIMD 寄存器 token（v0/q1/d2/s3/h4/b5，可带 .16b 之类的排列说明）。
+ * 必要性：QBDI 一律给 LLVM 的 MC 名（"Q0"），但反汇编里可能写作 "v0.16b"；
+ * 而 trace-ui 严格按反汇编里的写法去注解中找 "名字=0x值"。
+ * 实测：ld1 {q2}, [x0] 配 "v2=0x..." 取不到值，配 "q2=0x..." 才行。 */
+struct SimdRegToken {
+    char name[8];
+    int  num;
+    bool used;
+};
+
+static int collect_disasm_simd_tokens(const char *text, SimdRegToken *out, int max)
+{
+    int n = 0;
+    if (text == nullptr || out == nullptr) {
+        return 0;
+    }
+    for (const char *p = text; *p != '\0'; ++p) {
+        char c = *p;
+        if (c != 'v' && c != 'q' && c != 'd' && c != 's' && c != 'h' && c != 'b') {
+            continue;
+        }
+        // 前一个字符必须是分隔符，避免把 "ld1" 的 d1、"add" 的 d 当成寄存器
+        if (p != text) {
+            char prev = *(p - 1);
+            if ((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') ||
+                (prev >= '0' && prev <= '9')) {
+                continue;
+            }
+        }
+        const char *d = p + 1;
+        if (*d < '0' || *d > '9') {
+            continue;
+        }
+        int num = *d - '0';
+        int digits = 1;
+        if (d[1] >= '0' && d[1] <= '9') {
+            num = num * 10 + (d[1] - '0');
+            digits = 2;
+        }
+        if (num > 31) {
+            continue;
+        }
+        if (n < max) {
+            snprintf(out[n].name, sizeof(out[n].name), "%c%d", c, num);
+            out[n].num = num;
+            out[n].used = false;
+            n++;
+        }
+        p = d + digits - 1;
+    }
+    return n;
+}
+
+// 为第 idx 个 SIMD 寄存器取名字：优先反汇编写法（编号一致），否则退回 QBDI 名（小写）。
+// 同一个寄存器可能在一条指令里出现多次（如 eor v0.16b, v0.16b, v1.16b），
+// 因此 token 不做“消费”，按编号复用即可（trace-ui 允许重复的 name=0x）。
+static const char *simd_operand_name(SimdRegToken *tokens, int num_tokens,
+                                     const char *qbdi_name, int idx,
+                                     char *buf, size_t buf_size)
+{
+    for (int i = 0; i < num_tokens; ++i) {
+        if (tokens[i].num == idx) {
+            tokens[i].used = true;
+            lower_reg_name(buf, buf_size, tokens[i].name);
+            return buf;
+        }
+    }
+    lower_reg_name(buf, buf_size, qbdi_name);
+    return buf;
+}
+
+// 把 pending(上一条指令)用当前寄存器状态补全并输出。
+// 输出顺序与 GumTrace 一致:
+//   [mod] abs!off asm; 读寄存器 mem_r/w=地址 -> 写寄存器
+//   call func: name(args) / argsN: ... / hexdump ... / ret: 0x...
+static void flushPending(QBDI::GPRState *gprState, QBDI::FPRState *fprState)
 {
     if (!pending.valid) return;
 
@@ -145,19 +272,38 @@ static void flushPending(QBDI::GPRState *gprState)
     }
 
     if (pending.numWrite > 0) {
-        char wbuf[256];
+        char wbuf[512];
         int woff = 0;
         for (int i = 0; i < pending.numWrite; ++i) {
-            uint64_t v = QBDI_GPR_GET(gprState, pending.writeRegs[i]);  // 此刻 = 上一条执行后的值
-            int n = snprintf(wbuf + woff, sizeof(wbuf) - woff, "%s=0x%" PRIx64 " ",
-                             pending.writeNames[i], v);
+            const PendingInst::WriteReg &w = pending.writes[i];
+            char vhex[40];
+            if (w.is_fpr) {
+                // 此刻 = 上一条执行后的值
+                simd_value_hex(vhex, sizeof(vhex), fprState, w.idx, w.size);
+            } else {
+                uint64_t gv = (uint64_t)QBDI_GPR_GET(gprState, w.idx);
+                if (w.size == 4) {
+                    gv &= 0xFFFFFFFFULL;
+                }
+                snprintf(vhex, sizeof(vhex), "%" PRIx64, gv);
+            }
+            int n = snprintf(wbuf + woff, sizeof(wbuf) - woff, "%s=0x%s ", w.name, vhex);
             if (n > 0) woff += ((size_t)n < sizeof(wbuf) - woff) ? n : (int)(sizeof(wbuf) - woff - 1);
-            if (woff >= (int)sizeof(wbuf)) { woff = sizeof(wbuf) - 1; break; }
+            if (woff >= (int)sizeof(wbuf) - 48) { break; }
         }
         appendlog("-> ");
         appendlog_n(wbuf, woff);
     }
     appendlogendl();
+
+    /* JNI 调用的事后处理：此刻寄存器 = 该 JNI 调用执行后，x0 是返回值
+     * （jclass / jmethodID / jfieldID），用来建立名称映射并把解析结果
+     * 以 argsN: 行补进注解（trace-ui 只显示 call func/argsN/ret/hexdump）。 */
+    if (pending.isJniCall && pending.jniName[0] != '\0') {
+        g_annot_mode = true;
+        jni_after_call(pending.jniName, pending.jniPreArgs, (uint64_t)QBDI_GPR_GET(gprState, 0));
+        g_annot_mode = false;
+    }
 
     /* GumTrace 风格调用注解：紧跟在指令行之后，trace-ui 会把它关联到该分支指令 */
     if (pending.annotLen > 0) {
@@ -177,6 +323,8 @@ static void flushPending(QBDI::GPRState *gprState)
     pending.annotLen = 0;
     pending.annot[0] = '\0';
     pending.hasCall = false;
+    pending.isJniCall = false;
+    pending.jniName[0] = '\0';
 }
 static void save_regs(size_t* regs)
 {
@@ -235,7 +383,7 @@ size_t trace(size_t regs[31])
     LOGE("trace begin");
     bool qbdi_success = qvm.call(&qbdi_retval, (uint64_t)function_address);
     LOGE("trace end");
-    flushPending(qbdi_state);
+    flushPending(qbdi_state, qvm.getFPRState());
     if (qbdi_success) {
         writelog();
         LOGE("trace completed successfully %s",_logger->logfile.c_str());
@@ -400,12 +548,14 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
     auto thiz = (class vm *)data;
 
     //上一条指令的信息全部拿到了，写入
-    flushPending(gprState);
+    flushPending(gprState, fprState);
 
     // 注解区归当前指令所有
     pending.annotLen = 0;
     pending.annot[0] = '\0';
     pending.hasCall = false;
+    pending.isJniCall = false;
+    pending.jniName[0] = '\0';
 
     // 获取当前指令的分析信息
     const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION  | QBDI::ANALYSIS_OPERANDS);
@@ -435,21 +585,45 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
      * 否则 trace-ui 的无分号路径会把 "-> " 当成指令文本的一部分 */
     off += snprintf(pending.line + off, sizeof(pending.line) - off, "; ");
 
-    char rbuf[512];
+    /* SIMD 寄存器名要和反汇编里的写法一致（ld1 {q2} 就得写 q2，ld1 {v0.16b} 就得写 v0）。
+     * 注意用缓存的 disasm：instAnalysis->disassembly 在本回调的
+     * ANALYSIS_INSTRUCTION|ANALYSIS_OPERANDS 请求下并不保证可用。 */
+    SimdRegToken simd_tokens[16];
+    int num_simd_tokens = collect_disasm_simd_tokens(disasm, simd_tokens, 16);
+
+    char rbuf[2048];
     int roff = 0;
     for (int i = 0; i < instAnalysis->numOperands; ++i)
     {
         auto& op = instAnalysis->operands[i];
-        if ((op.regAccess == QBDI::REGISTER_READ || op.regAccess == QBDI::REGISTER_READ_WRITE)
-            && op.regCtxIdx != -1 && op.type == OPERAND_GPR && op.regName != nullptr)
-        {
+        if (op.regCtxIdx < 0 || op.regName == nullptr) {
+            continue;
+        }
+        const bool readable = (op.regAccess == QBDI::REGISTER_READ || op.regAccess == QBDI::REGISTER_READ_WRITE);
+        if (!readable) {
+            continue;
+        }
+        if (op.type == QBDI::OPERAND_GPR) {
             char lname[16];
             lower_reg_name(lname, sizeof(lname), op.regName);
-            uint64_t regValue = QBDI_GPR_GET(gprState, op.regCtxIdx);
-            int n = snprintf(rbuf + roff, sizeof(rbuf) - roff, "%s=0x%" PRIx64 " ",
-                             lname, regValue);
+            uint64_t regValue = (uint64_t)QBDI_GPR_GET(gprState, op.regCtxIdx);
+            // w 寄存器只取低 32 位（与 GumTrace 的 get_register_value 行为一致）
+            if (op.size == 4) {
+                regValue &= 0xFFFFFFFFULL;
+            }
+            int n = snprintf(rbuf + roff, sizeof(rbuf) - roff, "%s=0x%" PRIx64 " ", lname, regValue);
             if (n > 0) roff += ((size_t)n < sizeof(rbuf) - roff) ? n : (int)(sizeof(rbuf) - roff - 1);
-            if (roff >= (int)sizeof(rbuf) - 64) { break; }
+        } else if (op.type == QBDI::OPERAND_FPR && op.regCtxIdx < 32) {
+            char lname[16];
+            const char *nm = simd_operand_name(simd_tokens, num_simd_tokens, op.regName,
+                                               op.regCtxIdx, lname, sizeof(lname));
+            char vhex[40];
+            simd_value_hex(vhex, sizeof(vhex), fprState, op.regCtxIdx, op.size);
+            int n = snprintf(rbuf + roff, sizeof(rbuf) - roff, "%s=0x%s ", nm, vhex);
+            if (n > 0) roff += ((size_t)n < sizeof(rbuf) - roff) ? n : (int)(sizeof(rbuf) - roff - 1);
+        }
+        if (roff >= (int)sizeof(rbuf) - 80) {
+            break;
         }
     }
     if (roff > 0) {
@@ -461,30 +635,47 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
 
     pending.lineLen = off;
 
-    // ④ 记录当前指令会写哪些寄存器,等下一条 PRE 来补值
+    // ④ 记录当前指令会写哪些寄存器,等下一条 PRE 来补值（GPR 与 SIMD 都要记）
     pending.numWrite = 0;
     for (int i = 0; i < instAnalysis->numOperands; ++i)
     {
         auto& op = instAnalysis->operands[i];
-        if ((op.regAccess == REGISTER_WRITE || op.regAccess == REGISTER_READ_WRITE)
-            && op.regCtxIdx != -1 && op.type == OPERAND_GPR && op.regName != nullptr)
-        {
-            if (pending.numWrite < 8) {
-                pending.writeRegs[pending.numWrite] = op.regCtxIdx;
-                lower_reg_name(pending.writeNames[pending.numWrite],
-                               sizeof(pending.writeNames[0]), op.regName);
-                pending.numWrite++;
-            }
+        if (op.regCtxIdx < 0 || op.regName == nullptr) {
+            continue;
         }
+        if (op.regAccess != REGISTER_WRITE && op.regAccess != REGISTER_READ_WRITE) {
+            continue;
+        }
+        if (pending.numWrite >= (int)(sizeof(pending.writes) / sizeof(pending.writes[0]))) {
+            break;
+        }
+        PendingInst::WriteReg &w = pending.writes[pending.numWrite];
+        w.idx = (uint8_t)op.regCtxIdx;
+        if (op.type == QBDI::OPERAND_GPR) {
+            w.is_fpr = 0;
+            w.size = (op.size >= 1 && op.size <= 8) ? op.size : 8;
+            lower_reg_name(w.name, sizeof(w.name), op.regName);
+        } else if (op.type == QBDI::OPERAND_FPR && op.regCtxIdx < 32) {
+            w.is_fpr = 1;
+            w.size = (op.size >= 1 && op.size <= 16) ? op.size : 16;
+            char lname[16];
+            const char *nm = simd_operand_name(simd_tokens, num_simd_tokens, op.regName,
+                                               op.regCtxIdx, lname, sizeof(lname));
+            snprintf(w.name, sizeof(w.name), "%s", nm);
+        } else {
+            continue;
+        }
+        pending.numWrite++;
     }
     pending.memLen = 0;
     pending.memInfo[0] = '\0';
     pending.valid = true;
 
     /* 执行前的 libc/JNI/自定义 hook。
-     * 特殊行先暂存到注解区（g_annot_mode），由 flushPending 在指令行之后写出；
-     * 否则特殊行会落在指令行之前，trace-ui 会把它关联到错误的分支指令。 */
+     * 特殊行先暂存到注解区（g_annot_mode），由 flushPending 在指令行之后写出，
+     * 否则特殊行会落在指令行之前，trace-ui 会关联到错误的分支指令。 */
     bool hasCall = false;
+    jni_clear_last_call_name();
     g_annot_mode = true;
 
     //执行前hook
@@ -539,6 +730,17 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
 
     g_annot_mode = false;
     pending.hasCall = hasCall;
+
+    /* JNI 调用：记下函数名与调用前的参数（返回值要等调用返回才能读，
+     * 见 flushPending 里的 jni_after_call） */
+    const char *jni_name = jni_last_call_name();
+    if (hasCall && jni_name != nullptr) {
+        pending.isJniCall = true;
+        snprintf(pending.jniName, sizeof(pending.jniName), "%s", jni_name);
+        for (int i = 0; i < 8; ++i) {
+            pending.jniPreArgs[i] = (uint64_t)QBDI_GPR_GET(gprState, i);
+        }
+    }
 
     if(_logger != nullptr && sdslen(_logger->buf) > bufsize)
     {

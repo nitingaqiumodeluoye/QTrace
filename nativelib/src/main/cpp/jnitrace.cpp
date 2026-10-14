@@ -13,6 +13,7 @@
 #include "logger.h"
 #include "TraceUtils.h"
 #include <vector>
+#include <string>
 #include <cstdio>
 #include <cinttypes>
 #include <cstring>
@@ -77,9 +78,138 @@ static bool checkSetup()
 
 /* ===== GumTrace 风格注解辅助 ===== */
 
+/* ===== JNI 句柄 → 名称映射（GumTrace 的 jclass/jmethod 等价物） =====
+ * trace-ui 不识别 "jclass:"/"jmethod:" 行（未识别的特殊行会被记入 consumed_seqs
+ * 而隐藏），所以解析结果一律用 "argsN:" 承载：tooltip / summary / args 都能看到。
+ * JNI 的返回值只能在调用返回后读到，因此映射在 jni_after_call 里建立。 */
+static std::unordered_map<uint64_t, std::string> jni_classes;          // jclass → 类名
+static std::unordered_map<uint64_t, std::string> jni_methods;          // jmethodID → 方法名
+static std::unordered_map<uint64_t, std::string> jni_methods_classes;  // jmethodID → 类名
+static std::unordered_map<uint64_t, std::string> jni_fields;           // jfieldID → 字段名
+static std::unordered_map<uint64_t, std::string> jni_obj_classes;      // jobject → 类名
+
+static const char* g_last_call_name = nullptr;
+
+const char* jni_last_call_name() { return g_last_call_name; }
+void jni_clear_last_call_name() { g_last_call_name = nullptr; }
+
+static const char* jni_map_get(const std::unordered_map<uint64_t, std::string>& m, uint64_t key)
+{
+    if (key == 0) {
+        return nullptr;
+    }
+    auto it = m.find(key);
+    return (it == m.end()) ? nullptr : it->second.c_str();
+}
+
+/* 安全读取一个 C 字符串（process_vm_readv，不用裸指针解引用，避免野指针崩溃） */
+static bool jni_read_cstr(uint64_t addr, char* out, size_t out_size)
+{
+    if (out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    if (addr < 0x100000000ULL) {
+        return false;
+    }
+    std::vector<uint8_t> buf(out_size, 0);
+    if (!safeReadMemory(addr, buf.data(), buf.size())) {
+        return false;
+    }
+    size_t i = 0;
+    for (; i + 1 < out_size && buf[i] != 0; ++i) {
+        out[i] = (char)buf[i];
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
+/* 调用返回后：用返回值 x0 建立句柄映射，并把解析结果写成 args0: 行。
+ * args0 是空闲槽位（x0 是 JNIEnv*，从不作为参数打印），不会和真实参数冲突。 */
+void jni_after_call(const char* func_name, const uint64_t* pre_args, uint64_t ret_value)
+{
+    if (func_name == nullptr || pre_args == nullptr) {
+        return;
+    }
+    std::string nm = func_name;
+    char buf[512];
+
+    if (nm == "FindClass" || nm == "DefineClass") {
+        if (ret_value != 0 && jni_read_cstr(pre_args[1], buf, sizeof(buf))) {
+            jni_classes[ret_value] = buf;
+            appendformat("args0: <jclass %s>", buf);
+            appendlogendl();
+        }
+    } else if (nm == "GetMethodID" || nm == "GetStaticMethodID") {
+        if (ret_value != 0 && jni_read_cstr(pre_args[2], buf, sizeof(buf))) {
+            jni_methods[ret_value] = buf;
+            const char* cls = jni_map_get(jni_classes, pre_args[1]);
+            if (cls != nullptr) {
+                jni_methods_classes[ret_value] = cls;
+                appendformat("args0: <jmethodID %s.%s>", cls, buf);
+            } else {
+                appendformat("args0: <jmethodID %s>", buf);
+            }
+            appendlogendl();
+        }
+    } else if (nm == "GetFieldID" || nm == "GetStaticFieldID") {
+        if (ret_value != 0 && jni_read_cstr(pre_args[2], buf, sizeof(buf))) {
+            jni_fields[ret_value] = buf;
+            const char* cls = jni_map_get(jni_classes, pre_args[1]);
+            if (cls != nullptr) {
+                appendformat("args0: <jfieldID %s.%s>", cls, buf);
+            } else {
+                appendformat("args0: <jfieldID %s>", buf);
+            }
+            appendlogendl();
+        }
+    } else if (nm == "GetObjectClass") {
+        /* 建立 jobject → 类名（比 GumTrace 只看 obj==jclass 的启发式更准） */
+        const char* cls = jni_map_get(jni_classes, ret_value);
+        if (cls != nullptr && pre_args[1] != 0) {
+            jni_obj_classes[pre_args[1]] = cls;
+            appendformat("args0: <jclass %s>", cls);
+            appendlogendl();
+        }
+    } else if (nm == "NewStringUTF") {
+        if (ret_value != 0 && jni_read_cstr(pre_args[1], buf, sizeof(buf))) {
+            appendformat("args0: <jstring \"%s\">", buf);
+            appendlogendl();
+        }
+    }
+}
+
+/* Call*Method：把 x1(obj/jclass) 与 x2(mid) 翻译成可读名字 */
+static void jni_emit_method_info(int obj_slot, uint64_t obj, int mid_slot, uint64_t mid)
+{
+    const char* cls = jni_map_get(jni_methods_classes, mid);
+    if (cls == nullptr) cls = jni_map_get(jni_classes, obj);
+    if (cls == nullptr) cls = jni_map_get(jni_obj_classes, obj);
+    if (cls != nullptr) {
+        appendformat("args%d: <jclass %s>", obj_slot, cls);
+        appendlogendl();
+    }
+    const char* m = jni_map_get(jni_methods, mid);
+    if (m != nullptr) {
+        appendformat("args%d: <jmethod %s>", mid_slot, m);
+        appendlogendl();
+    }
+}
+
+/* Get/Set*Field：把 fid 翻译成字段名 */
+static void jni_emit_field_info(int slot, uint64_t fid)
+{
+    const char* f = jni_map_get(jni_fields, fid);
+    if (f != nullptr) {
+        appendformat("args%d: <jfield %s>", slot, f);
+        appendlogendl();
+    }
+}
+
 /* call jni func: name(0x.., 0x..) */
 static void jni_call_begin(const char* name, QBDI::GPRState *gprState, int n)
 {
+    g_last_call_name = name;
     char buf[512];
     int off = 0;
     int w = snprintf(buf + off, sizeof(buf) - off, "call jni func: %s(", name);
@@ -94,24 +224,14 @@ static void jni_call_begin(const char* name, QBDI::GPRState *gprState, int n)
     appendlogendl();
 }
 
-/* argsN: <C 字符串>（用 process_vm_readv 安全读取，避免野指针崩溃） */
+/* argsN: <C 字符串> */
 static void jni_arg_cstr(int idx, uint64_t addr)
 {
-    if (addr < 0x100000000ULL) {
-        return;
+    char buf[256];
+    if (jni_read_cstr(addr, buf, sizeof(buf))) {
+        appendformat("args%d: %s", idx, buf);
+        appendlogendl();
     }
-    std::vector<uint8_t> buf(256, 0);
-    if (!safeReadMemory(addr, buf.data(), buf.size())) {
-        return;
-    }
-    size_t i = 0;
-    for (; i + 1 < buf.size() && buf[i] != 0; ++i) {}
-    buf[i] = '\0';
-    if (i == 0) {
-        return;
-    }
-    appendformat("args%d: %s", idx, (const char*)buf.data());
-    appendlogendl();
 }
 
 void trace_FindClass(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -253,6 +373,7 @@ void trace_GetIntField(QBDI::VM *vm, QBDI::GPRState *gprState)
     jni_call_begin("GetIntField", gprState, 3);
     appendformat("args2: 0x%" PRIx64, jfield);
     appendlogendl();
+    jni_emit_field_info(2, jfield);
     if(debug)
     {
         LOGE("JNI GetIntField: fieldId:0x%lx,obj:0x%lx,env:0x%lx",jfield,jobj,jnienv);
@@ -283,6 +404,7 @@ void trace_CallStaticObjectMethodV(QBDI::VM *vm, QBDI::GPRState *gprState)
         return;
     }
     jni_call_begin("CallStaticObjectMethodV", gprState, 3);
+    jni_emit_method_info(1, QBDI_GPR_GET(gprState,1), 2, QBDI_GPR_GET(gprState,2));
     if(debug)
     {
         LOGE("JNI CallStaticObjectMethodV");
@@ -316,6 +438,7 @@ void trace_GetLongField(QBDI::VM *vm, QBDI::GPRState *gprState)
     jni_call_begin("GetLongField", gprState, 3);
     appendformat("args2: 0x%" PRIx64, jfield);
     appendlogendl();
+    jni_emit_field_info(2, jfield);
     if(debug)
     {
         LOGE("JNI GetLongField: fieldId:0x%lx",jfield);
