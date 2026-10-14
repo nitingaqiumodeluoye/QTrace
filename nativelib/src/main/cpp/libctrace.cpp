@@ -508,6 +508,7 @@ static const KnownFunc kKnownFuncs[] = {
     { "aligned_alloc", 2, -1, -1, -1, -1 },
     { "gettimeofday", 2, -1, -1, 0, -2 },
     { "srand48", 1, -1, -1, -1, -1 },
+    { "sysconf", 1, -1, -1, -1, -1 },
     { "syscall", 1, -1, -1, -1, -1 },
     { "arc4random_buf", 2, -1, -1, 0, 1 },
 };
