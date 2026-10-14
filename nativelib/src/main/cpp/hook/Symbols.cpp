@@ -21,12 +21,14 @@ namespace {
 struct SymEntry {
     uint64_t addr;
     uint32_t name_off;   // 在 Module::names 池中的偏移
+    uint32_t seq;        // 枚举顺序（见 parse_module 里同地址去重的说明）
 };
 
 struct Module {
     uint64_t base = 0;          // ELF 装载基址（file offset == 0 的那个映射）
     std::string path;
     bool parsed = false;
+    uint32_t seq = 0;           // 符号枚举计数器
     std::vector<char> names;    // 名字池
     std::vector<SymEntry> syms; // 按 addr 升序
 };
@@ -148,7 +150,7 @@ size_t ingest_symtab(Module &m, int fd, const Elf64_Shdr &symtab,
 
         uint32_t off = static_cast<uint32_t>(m.names.size());
         m.names.insert(m.names.end(), nm, nm + nm_len + 1); // 含终止符
-        m.syms.push_back(SymEntry{ m.base + s.st_value, off });
+        m.syms.push_back(SymEntry{ m.base + s.st_value, off, m.seq++ });
     }
 
     return seen;
@@ -232,8 +234,25 @@ void parse_module(Module &m)
     if (m.syms.empty()) {
         return;
     }
+    /* 同地址多符号时保留**最后**枚举到的那个，对齐 GumTrace：
+     *   GumTrace 是 func_maps[details->address] = details->name;
+     * （std::map 赋值），而 Frida 按 .symtab 文件顺序枚举，所以后者覆盖前者。
+     * 这一步很关键：libc 的 .symtab 里映射符号与真实函数同地址 ——
+     * 实测 free=0x47af8 同时有 $x.1(idx 113) 与 free(idx 6501)、
+     * malloc=0x47c30 有 $x.5(124) 与 malloc(6503)、
+     * pthread_mutex_lock=0xebba8 有 $x.9(6160) 与其本体(6512)、
+     * strstr=0xce9e0 有 $x.0(4908) 与其本体(6527)。真实函数在 .symtab 里靠后，
+     * 所以“后者胜”正好让真实函数名生效。
+     * 之前的写法用 std::sort（不稳定）+ std::unique（保留每组第一个），
+     * 同地址保留哪个是不确定的，实测把 free/malloc/pthread_mutex_lock/
+     * strstr 等 14 个真实名字顶成了 $x.N。 */
     std::sort(m.syms.begin(), m.syms.end(),
-              [](const SymEntry &a, const SymEntry &b) { return a.addr < b.addr; });
+              [](const SymEntry &a, const SymEntry &b) {
+                  if (a.addr != b.addr) {
+                      return a.addr < b.addr;
+                  }
+                  return a.seq > b.seq;   // seq 大的排在前，会被 unique 留下
+              });
     m.syms.erase(std::unique(m.syms.begin(), m.syms.end(),
                              [](const SymEntry &a, const SymEntry &b) {
                                  return a.addr == b.addr;
