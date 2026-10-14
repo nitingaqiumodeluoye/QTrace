@@ -922,9 +922,24 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
                     (size_t)instAnalysis->address,
                     (instAnalysis->address - thiz->base), disasm);
 
-    /* GumTrace 总是先输出 "; "（即使没有任何寄存器注解），
-     * 否则 trace-ui 的无分号路径会把 "-> " 当成指令文本的一部分 */
-    off += snprintf(pending.line + off, sizeof(pending.line) - off, "; ");
+    /* GumTrace 组装行时是 【mnemonic + ' ' + op_str + "; "】（GumTrace.cpp:117-120），
+     * 对无操作数的指令（如 ret）因此是 "ret ; " —— 助记符与分号之间有一个空格。
+     * 这个空格不是可有可无的：GumTrace 自己的 TraceParser 用
+     * 【第一个空格/制表符】切助记符（TraceParser.cpp:571），而找分界用的是
+     * 【";" + " "】（TraceParser.cpp:597）：
+     *     "ret ; lr=0x..."  -> mnemonic="ret"    
+     *     "ret; lr=0x..."   -> mnemonic="ret;"    ← 分类失败
+     * 实测：没这个空格时，GumTrace 的 taint 工具把全部 17449 条 ret 归为
+     * OTHER（BRANCH 计数 90451 vs 应有的 107900）；补上后 OTHER 只剩 2 条
+     * sbfiz（那是 GumTrace 自己 classify_mnemonic 未覆盖的别名，capstone 也同样只输出 sbfiz）。
+     * 另外 trace-ui 也先输出 "; "（即使没有任何寄存器注解），
+     * 否则它的无分号路径会把 "-> " 当成指令文本的一部分。 */
+    if (strchr(disasm, ' ') == nullptr) {
+        // 无操作数：mnemonic + ' ' + "" + "; "，等价于补一个空格
+        off += snprintf(pending.line + off, sizeof(pending.line) - off, " ; ");
+    } else {
+        off += snprintf(pending.line + off, sizeof(pending.line) - off, "; ");
+    }
 
     /* SIMD 寄存器名要和反汇编里的写法一致（ld1 {q2} 就得写 q2，ld1 {v0.16b} 就得写 v0）。
      * 注意用缓存的 disasm：instAnalysis->disassembly 在本回调的
