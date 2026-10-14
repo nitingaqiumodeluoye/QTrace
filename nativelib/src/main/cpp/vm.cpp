@@ -267,10 +267,10 @@ static void flushPending(QBDI::GPRState *gprState, QBDI::FPRState *fprState)
 
     appendlog_n(pending.line, pending.lineLen);   // 上一条的 "[mod] abs!off asm ; 读"
 
-    /* 内存访问注解为 mem_r=/mem_w= 前缀 (内联在指令行尾, trace-ui 格式) */
+    /* 内存访问注解为 mem_r=/mem_w= 前缀 (内联在指令行尾, trace-ui 格式)。
+     * 不加额外前导空格：前面的内容（读寄存器段或 "; "）总是已以空格结尾，
+     * GumTrace 也是单空格（如 "sp=0x... mem_w=0x..."）。 */
     if (pending.memLen > 0) {
-        /* memInfo 现在是 "mem_r=0x... mem_w=0x..." 空格分隔 */
-        appendlog(" ");
         appendlog_n(pending.memInfo, pending.memLen);
     }
 
@@ -548,6 +548,37 @@ static size_t lastAddr = 0;
 
 static unordered_map<uint32_t,char*> disassemblecache;
 
+/* LLVM 的 AArch64 打印器用 TAB 分隔助记符与操作数（"\tsub\tsp, sp, #0x40"），
+ * 而 GumTrace/capstone 用空格（"sub sp, sp, #0x40"）。
+ * trace-ui 按「第一个空格」切分助记符，TAB 会让它取到 "sub\tsp," 这种错误助记符，
+ * 于是指令分类失败 → bl/br/svc 的 call 注解全部挂不上、变成孤儿行被隐藏。
+ * 因此在缓存时就规范化为单空格并去掉首尾空白。 */
+static void normalize_disasm(char *s)
+{
+    if (s == nullptr) {
+        return;
+    }
+    // TAB → 空格
+    char *w = s;
+    for (const char *r = s; *r != '\0'; ++r) {
+        *w++ = (*r == '\t') ? ' ' : *r;
+    }
+    *w = '\0';
+    // 去首部空白
+    char *p = s;
+    while (*p == ' ' || *p == '\n' || *p == '\r') {
+        ++p;
+    }
+    if (p != s) {
+        memmove(s, p, strlen(p) + 1);
+    }
+    // 去尾部空白
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\n' || s[n - 1] == '\r')) {
+        s[--n] = '\0';
+    }
+}
+
 /* ===== 调用注解：SVC 系统调用 / 符号级 call func ===== */
 
 // 计算 BL/BLR/BR 的跳转目标；无法确定返回 0。
@@ -679,6 +710,7 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
         size_t len = strlen(full->disassembly) + 1;
         disasm = (char*)malloc(len);
         memcpy(disasm, full->disassembly, len);
+        normalize_disasm(disasm);
         disassemblecache.emplace(bytecode, disasm);
     }
 
