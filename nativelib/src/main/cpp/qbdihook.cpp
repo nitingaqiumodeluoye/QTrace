@@ -19,7 +19,7 @@ void hook_0x71DD54(QBDI::VM *vm, QBDI::GPRState *gprState)
     memset(base64,0,2*len);
     base64_encode(base64,(uint8_t*)input,len);
     LOGE("base64:src:%p,raw:%s,res:%s",input,hex,base64);
-    appendlogendl();
+    // 注解区内不加前导空行（保持紧跟在指令行之后）
     appendformat("base64:src:%p,raw:%s,res:%s",input,hex,base64);
     appendlogendl();
     free(hex);

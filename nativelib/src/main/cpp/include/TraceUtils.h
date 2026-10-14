@@ -4,6 +4,7 @@
 
 #ifndef XPOSEDNHOOK_HEXDUMP_H
 #define XPOSEDNHOOK_HEXDUMP_H
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -23,6 +24,12 @@
 
 // 将内存块按 hexdump 格式输出到日志缓冲区
 void hexdump_memory(std::stringstream &logbuf, const uint8_t* data, size_t size, uint64_t address) ;
+
+// 安全读取目标内存并按 GumTrace 格式写入日志（用于 call func 注解的 hexdump）
+void hexdump_to_log(uint64_t address, size_t count, bool force = false) ;
+
+// 把已在本地的 buffer 按 GumTrace 格式写入日志（display_address 仅用于行首显示）
+void hexdump_local_to_log(const uint8_t* data, size_t size, uint64_t display_address) ;
 // 地址范围的结构体，用于缓存 maps 文件中的每个模块范围
 
 

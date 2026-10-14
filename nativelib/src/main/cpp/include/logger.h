@@ -26,6 +26,13 @@ struct logger{
 
 extern logger *_logger;
 
+/* GumTrace 风格注解缓冲：
+ * trace 侧的 libc/JNI/自定义 hook 特殊行不直接写进日志，而是先暂存到
+ * 当前指令的注解区，由 vm.cpp 的 flushPending 在指令行之后写出。
+ * 这样 trace-ui 才能把 call func:/argsN:/ret: 关联到对应的分支指令。 */
+extern bool g_annot_mode;
+void pending_annot_append(const char *str, size_t len);
+
 void initLogger(size_t function_address);
 void deleteLogger();
 void writelog();

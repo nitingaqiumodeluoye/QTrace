@@ -2,32 +2,67 @@
 // Created by zgy on 2025/11/27.
 //
 #include "TraceUtils.h"
-// 将内存块按 hexdump 格式输出到日志缓冲区
+// 将内存块按 GumTrace 的 hexdump 格式输出到日志缓冲区
+// GumTrace 格式:
+//   hexdump at address 0x1234 with length 0x10:
+//   1234: 48 74 74 70 ... |Http|
 void hexdump_memory(std::stringstream &logbuf, const uint8_t* data, size_t size, uint64_t address) {
+    logbuf << "hexdump at address 0x" << std::hex << address
+           << " with length 0x" << std::hex << size << ":\n";
+
     size_t offset = 0;
-
     while (offset < size) {
-        // 输出当前行的基址
-        logbuf << std::hex << std::setw(8) << std::setfill('0') << (address + offset) << ": ";
+        // 输出当前行的基址（GumTrace 不加零填充、不加中间分隔）
+        logbuf << std::hex << (address + offset) << ": ";
 
-        // 输出每一行的十六进制数据和ASCII字符
-        std::string ascii; // 暂存 ASCII 字符串
+        std::string ascii("|"); // 暂存 ASCII 字符串
         for (size_t i = 0; i < 16; ++i) {
             if (offset + i < size) {
                 uint8_t byte = data[offset + i];
                 logbuf << std::setw(2) << std::setfill('0') << std::hex << static_cast<int>(byte) << " ";
-                ascii += (std::isprint(byte) ? static_cast<char>(byte) : '.'); // 可打印字符直接显示，否则用 .
+                ascii += (std::isprint(byte) ? static_cast<char>(byte) : '.');
             } else {
-                logbuf << "   "; // 如果数据不足16字节，填充空格
+                logbuf << "   "; // 数据不足 16 字节时填充空格
                 ascii += " ";
             }
-            if (i == 7) logbuf << " "; // 中间分隔
         }
+        ascii += "|";
+        logbuf << ascii;
 
-        // 输出 ASCII 表示
-        logbuf << " |" << ascii << "|" << std::endl;
+        if (offset + 16 < size) {
+            logbuf << "\n";
+        }
         offset += 16;
     }
+}
+
+// 安全地把 [address, address+count) 的内存按 GumTrace 格式写入日志。
+// 用于 call func / call jni func 注解中的 hexdump（GumTrace 的 hexdump 注解）。
+void hexdump_to_log(uint64_t address, size_t count, bool force) {
+    // AArch64 userspace 合法指针几乎都 > 4GB，小值当作整型参数丢弃
+    if (address < 0x100000000ULL) {
+        return;
+    }
+    if (count == 0) {
+        if (!force) {
+            return;
+        }
+        count = 256;
+    }
+    if (count > 0x1000) {
+        count = 0x1000;
+    }
+
+    static thread_local std::vector<uint8_t> buf;
+    buf.resize(count);
+    if (!safeReadMemory(address, buf.data(), count)) {
+        return;
+    }
+
+    std::stringstream ss;
+    hexdump_memory(ss, buf.data(), count, address);
+    appendlog(ss.str().c_str());
+    appendlogendl();
 }
 
 // 缓存地址范围和已解析的符号信息
@@ -43,6 +78,20 @@ struct MemoryRange {
 std::vector<MemoryRange>& getMemoryRanges() {
     static std::vector<MemoryRange> memoryRanges;
     return memoryRanges;
+}
+
+// 把已在本地的 buffer 按 GumTrace 格式写入日志
+void hexdump_local_to_log(const uint8_t* data, size_t size, uint64_t display_address) {
+    if (data == nullptr || size == 0) {
+        return;
+    }
+    if (size > 0x1000) {
+        size = 0x1000;
+    }
+    std::stringstream ss;
+    hexdump_memory(ss, data, size, display_address);
+    appendlog(ss.str().c_str());
+    appendlogendl();
 }
 
 // 从 /proc/self/maps 读取并缓存模块地址范围

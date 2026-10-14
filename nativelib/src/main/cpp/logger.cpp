@@ -5,6 +5,8 @@
 #include "TraceLogger.h"
 #include "sds.h"
 #include <fcntl.h>
+#include <cstring>
+#include <cstdio>
 #include "unistd.h"
 #include "vm.h"
 logger *_logger = nullptr;
@@ -32,15 +34,27 @@ void deleteLogger()
 
 void appendlog(const char* str)
 {
-      if(_logger != nullptr)
+      if(_logger == nullptr || str == nullptr)
       {
-          _logger->buf = sdscat(_logger->buf, str);
+          return;
       }
+      if (g_annot_mode)
+      {
+          pending_annot_append(str, strlen(str));
+          return;
+      }
+      _logger->buf = sdscat(_logger->buf, str);
 }
 
 void appendlog_n(const char* str, size_t len) {
-    if (_logger != nullptr)
-        _logger->buf = sdscatlen(_logger->buf, str, len);
+    if (_logger == nullptr || str == nullptr)
+        return;
+    if (g_annot_mode)
+    {
+        pending_annot_append(str, len);
+        return;
+    }
+    _logger->buf = sdscatlen(_logger->buf, str, len);
 }
 
 void appendlogendl()
@@ -50,8 +64,24 @@ void appendlogendl()
 
 void appendformat(const char* format,...)
 {
+    if (_logger == nullptr || format == nullptr)
+    {
+        return;
+    }
     va_list ap;
     va_start(ap, format);
+    if (g_annot_mode)
+    {
+        char tmp[2048];
+        int n = vsnprintf(tmp, sizeof(tmp), format, ap);
+        va_end(ap);
+        if (n > 0)
+        {
+            size_t len = ((size_t)n < sizeof(tmp)) ? (size_t)n : (sizeof(tmp) - 1);
+            pending_annot_append(tmp, len);
+        }
+        return;
+    }
     _logger->buf = sdscatvprintf(_logger->buf,format,ap);
     va_end(ap);
 }

@@ -1,11 +1,21 @@
 //
 // Created by zgy on 2025/10/30.
 //
-
+// JNI 调用追踪。输出对齐 GumTrace 的注解格式（trace-ui 可直接解析）：
+//   call jni func: GetMethodID(0x78f4342950, 0x799ac3f209, 0x7754328330, 0x77243c0cf0)
+//   args2: getBytes
+//   args3: (Ljava/lang/String;)[B
+//   ret: 0x6fa77db0
+// 其中 `ret:` 由 vm.cpp 的 flushPending 统一补出，这里只负责 call/args。
 #include <dlfcn.h>
 #include "jnitrace.h"
 #include "HookUtils.h"
 #include "logger.h"
+#include "TraceUtils.h"
+#include <vector>
+#include <cstdio>
+#include <cinttypes>
+#include <cstring>
 
 const JNINativeInterface* pJFunc = nullptr;
  JNIEnv * jniEnv = nullptr;
@@ -65,6 +75,45 @@ static bool checkSetup()
     return true;
 }
 
+/* ===== GumTrace 风格注解辅助 ===== */
+
+/* call jni func: name(0x.., 0x..) */
+static void jni_call_begin(const char* name, QBDI::GPRState *gprState, int n)
+{
+    char buf[512];
+    int off = 0;
+    int w = snprintf(buf + off, sizeof(buf) - off, "call jni func: %s(", name);
+    if (w > 0) off += ((size_t)w < sizeof(buf) - off) ? w : (int)(sizeof(buf) - off - 1);
+    for (int i = 0; i < n && off < (int)sizeof(buf) - 32; ++i) {
+        w = snprintf(buf + off, sizeof(buf) - off, "%s0x%" PRIx64,
+                     i ? ", " : "", (uint64_t)QBDI_GPR_GET(gprState, i));
+        if (w > 0) off += ((size_t)w < sizeof(buf) - off) ? w : (int)(sizeof(buf) - off - 1);
+    }
+    snprintf(buf + off, sizeof(buf) - off, ")");
+    appendlog(buf);
+    appendlogendl();
+}
+
+/* argsN: <C 字符串>（用 process_vm_readv 安全读取，避免野指针崩溃） */
+static void jni_arg_cstr(int idx, uint64_t addr)
+{
+    if (addr < 0x100000000ULL) {
+        return;
+    }
+    std::vector<uint8_t> buf(256, 0);
+    if (!safeReadMemory(addr, buf.data(), buf.size())) {
+        return;
+    }
+    size_t i = 0;
+    for (; i + 1 < buf.size() && buf[i] != 0; ++i) {}
+    buf[i] = '\0';
+    if (i == 0) {
+        return;
+    }
+    appendformat("args%d: %s", idx, (const char*)buf.data());
+    appendlogendl();
+}
+
 void trace_FindClass(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     if(!checkSetup())
@@ -72,13 +121,12 @@ void trace_FindClass(QBDI::VM *vm, QBDI::GPRState *gprState)
         return;
     }
     uint64_t classname = QBDI_GPR_GET(gprState, 1);
+    jni_call_begin("FindClass", gprState, 2);
+    jni_arg_cstr(1, classname);
     if(debug)
     {
-        LOGE("JNI FindClass: %s",(char*)classname);
+        LOGE("JNI FindClass: 0x%lx", classname);
     }
-    appendlog("\n[log] JNI FindClass: ");
-    appendlog((char*)classname);
-    appendlogendl();
 }
 
 void trace_GetStringUTFChars(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -90,14 +138,17 @@ void trace_GetStringUTFChars(QBDI::VM *vm, QBDI::GPRState *gprState)
     uint64_t jnienv = QBDI_GPR_GET(gprState,0);
     uint64_t jstr = QBDI_GPR_GET(gprState,1);
     uint64_t jbool = QBDI_GPR_GET(gprState,2);
+    jni_call_begin("GetStringUTFChars", gprState, 3);
     const char* str = pJFunc->GetStringUTFChars((JNIEnv*)jnienv,(jstring)jstr,(jboolean*)jbool);
+    if (str != nullptr) {
+        appendformat("args1: %s", str);
+        appendlogendl();
+        pJFunc->ReleaseStringUTFChars((JNIEnv*)jnienv, (jstring)jstr, str);
+    }
     if(debug)
     {
-        LOGE("JNI GetStringUTFChars: %s",str);
+        LOGE("JNI GetStringUTFChars: 0x%lx", jstr);
     }
-    appendlog("\n[log] JNI GetStringUTFChars: ");
-    appendlog(str);
-    appendlogendl();
 }
 
 void trace_GetFieldID(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -108,16 +159,13 @@ void trace_GetFieldID(QBDI::VM *vm, QBDI::GPRState *gprState)
     }
     uint64_t name = QBDI_GPR_GET(gprState,2);
     uint64_t sig = QBDI_GPR_GET(gprState,3);
+    jni_call_begin("GetFieldID", gprState, 4);
+    jni_arg_cstr(2, name);
+    jni_arg_cstr(3, sig);
     if(debug)
     {
-        LOGE("JNI GetFieldID: name:%s,sig:%s",(char*)name,(char*)sig);
+        LOGE("JNI GetFieldID: 0x%lx,0x%lx",name,sig);
     }
-    appendlogendl();
-    appendlog("[log] JNI GetFieldID: name: ");
-    appendlog((char*)name);
-    appendlog(", sig:");
-    appendlog((char*)sig);
-    appendlogendl();
 }
 
 void trace_GetByteArrayElements(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -128,19 +176,25 @@ void trace_GetByteArrayElements(QBDI::VM *vm, QBDI::GPRState *gprState)
     }
     uint64_t jni = QBDI_GPR_GET(gprState,0);
     uint64_t arr = QBDI_GPR_GET(gprState,1);
-    jint size = pJFunc->GetArrayLength(reinterpret_cast<JNIEnv *>(jni), reinterpret_cast<jarray>(arr));
-    char* temp = (char*)malloc(2*size);
-    memset(temp,0,2*size);
-    pJFunc->GetByteArrayRegion(reinterpret_cast<JNIEnv *>(jni), reinterpret_cast<jbyteArray>(arr), 0, size,
-                               reinterpret_cast<jbyte *>(temp));
+    jni_call_begin("GetByteArrayElements", gprState, 3);
+    if (arr != 0) {
+        jsize size = pJFunc->GetArrayLength(reinterpret_cast<JNIEnv *>(jni), reinterpret_cast<jarray>(arr));
+        if (size > 0) {
+            // 数组内容本身不在 guest 内存里，需要通过 JNI 拷贝出来
+            std::vector<jbyte> bytes((size_t)size, 0);
+            pJFunc->GetByteArrayRegion(reinterpret_cast<JNIEnv *>(jni), reinterpret_cast<jbyteArray>(arr), 0, size,
+                                       bytes.data());
+            char pbuf[64];
+            snprintf(pbuf, sizeof(pbuf), "args1: <byteArray 0x%" PRIx64 " len=0x%x>", arr, size);
+            appendlog(pbuf);
+            appendlogendl();
+            hexdump_local_to_log((const uint8_t*)bytes.data(), (size_t)size, arr);
+        }
+    }
     if(debug)
     {
-        LOGE("JNI GetByteArrayElements:%x,%s",size,temp);
+        LOGE("JNI GetByteArrayElements: arr=0x%lx", arr);
     }
-    appendlogendl();
-    appendformat("[log] JNI GetByteArrayElements:%x,%s",size,temp);
-    appendlogendl();
-    free(temp);
 }
 
 void trace_GetArrayLength(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -151,14 +205,16 @@ void trace_GetArrayLength(QBDI::VM *vm, QBDI::GPRState *gprState)
     }
     uint64_t jni = QBDI_GPR_GET(gprState,0);
     uint64_t arr = QBDI_GPR_GET(gprState,1);
-    jint size = pJFunc->GetArrayLength(reinterpret_cast<JNIEnv *>(jni), reinterpret_cast<jarray>(arr));
+    jni_call_begin("GetArrayLength", gprState, 2);
+    if (arr != 0) {
+        jsize size = pJFunc->GetArrayLength(reinterpret_cast<JNIEnv *>(jni), reinterpret_cast<jarray>(arr));
+        appendformat("args1: <array len=0x%x>", size);
+        appendlogendl();
+    }
     if(debug)
     {
-        LOGE("JNI GetArrayLength:%lx,%x",arr,size);
+        LOGE("JNI GetArrayLength: 0x%lx", arr);
     }
-    appendlogendl();
-    appendformat("[log] JNI GetArrayLength:%lx,%x",arr,size);
-    appendlogendl();
 }
 
 void trace_GetByteArrayRegion(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -172,19 +228,17 @@ void trace_GetByteArrayRegion(QBDI::VM *vm, QBDI::GPRState *gprState)
     uint64_t x2 = QBDI_GPR_GET(gprState,2);
     uint64_t len = QBDI_GPR_GET(gprState,3);
     uint64_t jbuf = QBDI_GPR_GET(gprState,4);
-    char* tmp = (char*) malloc(len);
-    memset(tmp,0,len);
-    pJFunc->GetByteArrayRegion(reinterpret_cast<JNIEnv *>(x0), reinterpret_cast<jbyteArray>(x1), x2, len,
-                               reinterpret_cast<jbyte *>(tmp));
-
+    jni_call_begin("GetByteArrayRegion", gprState, 5);
+    std::vector<jbyte> bytes((size_t)(len > 0x1000 ? 0x1000 : len), 0);
+    if (len > 0 && x1 != 0) {
+        pJFunc->GetByteArrayRegion(reinterpret_cast<JNIEnv *>(x0), reinterpret_cast<jbyteArray>(x1), (jsize)x2,
+                                   (jsize)bytes.size(), bytes.data());
+        hexdump_local_to_log((const uint8_t*)bytes.data(), bytes.size(), x1);
+    }
     if(debug)
     {
-        LOGE("JNI GetByteArrayRegion: buf:%lx,%lx,%s",jbuf,len,tmp);
+        LOGE("JNI GetByteArrayRegion: buf:%lx,%lx",jbuf,len);
     }
-    appendlogendl();
-    appendformat("[log] JNI GetByteArrayRegion: %lx,%lx,%s",jbuf,len,tmp);
-    appendlogendl();
-    free(tmp);
 }
 
 void trace_GetIntField(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -196,17 +250,13 @@ void trace_GetIntField(QBDI::VM *vm, QBDI::GPRState *gprState)
     uint64_t jnienv = QBDI_GPR_GET(gprState,0);
     uint64_t jobj = QBDI_GPR_GET(gprState,1);
     uint64_t jfield = QBDI_GPR_GET(gprState,2);
-    jint res = pJFunc->GetIntField((JNIEnv*)jnienv,(jobject)jobj,(jfieldID)jfield);
+    jni_call_begin("GetIntField", gprState, 3);
+    appendformat("args2: 0x%" PRIx64, jfield);
+    appendlogendl();
     if(debug)
     {
-        LOGE("JNI GetIntField: filedId:%lx,res:%x",jfield,res);
+        LOGE("JNI GetIntField: fieldId:0x%lx,obj:0x%lx,env:0x%lx",jfield,jobj,jnienv);
     }
-    appendlogendl();
-    appendlog("[log] JNI GetIntField: filedId:");
-    appendformat("%lx",jfield);
-    appendlog(",res:");
-    appendformat("%x",res);
-    appendlogendl();
 }
 
 void trace_GetStaticFieldID(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -216,14 +266,14 @@ void trace_GetStaticFieldID(QBDI::VM *vm, QBDI::GPRState *gprState)
         return;
     }
     uint64_t name = QBDI_GPR_GET(gprState,2);
+    uint64_t sig = QBDI_GPR_GET(gprState,3);
+    jni_call_begin("GetStaticFieldID", gprState, 4);
+    jni_arg_cstr(2, name);
+    jni_arg_cstr(3, sig);
     if(debug)
     {
-        LOGE("JNI GetStaticFieldID: %s",(char*)name);
+        LOGE("JNI GetStaticFieldID: 0x%lx",name);
     }
-    appendlogendl();
-    appendlog("[log] JNI GetStaticFieldID: ");
-    appendlog((char*)name);
-    appendlogendl();
 }
 
 void trace_CallStaticObjectMethodV(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -232,14 +282,13 @@ void trace_CallStaticObjectMethodV(QBDI::VM *vm, QBDI::GPRState *gprState)
     {
         return;
     }
+    jni_call_begin("CallStaticObjectMethodV", gprState, 3);
     if(debug)
     {
         LOGE("JNI CallStaticObjectMethodV");
     }
-    appendlogendl();
-    appendlog("[log] JNI CallStaticObjectMethodV");
-    appendlogendl();
 }
+
 void trace_GetStaticMethodID(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     if(!checkSetup())
@@ -247,35 +296,30 @@ void trace_GetStaticMethodID(QBDI::VM *vm, QBDI::GPRState *gprState)
         return;
     }
     uint64_t name = QBDI_GPR_GET(gprState,2);
+    uint64_t sig = QBDI_GPR_GET(gprState,3);
+    jni_call_begin("GetStaticMethodID", gprState, 4);
+    jni_arg_cstr(2, name);
+    jni_arg_cstr(3, sig);
     if(debug)
     {
-        LOGE("JNI GetStaticMethodID: %s",(char*)name);
+        LOGE("JNI GetStaticMethodID: 0x%lx",name);
     }
-    appendlogendl();
-    appendlog("[log] JNI GetStaticMethodID: ");
-    appendlog((char*)name);
-    appendlogendl();
 }
+
 void trace_GetLongField(QBDI::VM *vm, QBDI::GPRState *gprState)
 {
     if(!checkSetup())
     {
         return;
     }
-    uint64_t jnienv = QBDI_GPR_GET(gprState,0);
-    uint64_t jobj = QBDI_GPR_GET(gprState,1);
     uint64_t jfield = QBDI_GPR_GET(gprState,2);
-    jlong res = pJFunc->GetLongField((JNIEnv*)jnienv,(jobject)jobj,(jfieldID)jfield);
+    jni_call_begin("GetLongField", gprState, 3);
+    appendformat("args2: 0x%" PRIx64, jfield);
+    appendlogendl();
     if(debug)
     {
-        LOGE("JNI GetLongField: filedId:%lx,res:%lx",jfield,res);
+        LOGE("JNI GetLongField: fieldId:0x%lx",jfield);
     }
-    appendlogendl();
-    appendlog("[log] JNI GetLongField: filedId:");
-    appendformat("%lx",jfield);
-    appendlog(",res:");
-    appendformat("%lx",res);
-    appendlogendl();
 }
 
 void trace_RegisterNatives(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -285,22 +329,18 @@ void trace_RegisterNatives(QBDI::VM *vm, QBDI::GPRState *gprState)
         return;
     }
     uint64_t funcs = QBDI_GPR_GET(gprState,2);
-    JNINativeMethod* nativeMethods = (JNINativeMethod*)funcs;
     uint64_t func_num = QBDI_GPR_GET(gprState,3);
+    jni_call_begin("RegisterNatives", gprState, 4);
+    appendformat("args2: <%llu native methods @0x%" PRIx64 ">", (unsigned long long)func_num, funcs);
     appendlogendl();
-    for(int i = 0;i<func_num;i++)
+    if(debug)
     {
-        if(debug)
+        JNINativeMethod* nativeMethods = (JNINativeMethod*)funcs;
+        for(uint64_t i = 0; i < func_num; i++)
         {
-            LOGE("JNI RegisterNatives: %s,%s,%p",nativeMethods[i].signature,nativeMethods[i].name,(void*)((size_t)nativeMethods[i].fnPtr - _g_trace_data->base));
+            LOGE("JNI RegisterNatives: %s,%s,%p",nativeMethods[i].signature,nativeMethods[i].name,
+                 (void*)((size_t)nativeMethods[i].fnPtr - _g_trace_data->base));
         }
-        appendlog("[log] JNI RegisterNatives: ");
-        appendlog(nativeMethods[i].signature);
-        appendlog(",");
-        appendlog(nativeMethods[i].name);
-        appendlog(",");
-        appendformat("%lx",(size_t)nativeMethods[i].fnPtr - _g_trace_data->base);
-        appendlogendl();
     }
 }
 
@@ -311,14 +351,14 @@ void trace_GetMethodID(QBDI::VM *vm, QBDI::GPRState *gprState)
         return;
     }
     uint64_t str = QBDI_GPR_GET(gprState, 2);
+    uint64_t sig = QBDI_GPR_GET(gprState, 3);
+    jni_call_begin("GetMethodID", gprState, 4);
+    jni_arg_cstr(2, str);
+    jni_arg_cstr(3, sig);
     if(debug)
     {
-        LOGE("JNI GetMethodID: %s",(char*)str);
+        LOGE("JNI GetMethodID: 0x%lx",str);
     }
-    appendlogendl();
-    appendlog("[log] JNI GetMethodID: ");
-    appendlog((char*)str);
-    appendlogendl();
 }
 
 void trace_NewString(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -328,14 +368,14 @@ void trace_NewString(QBDI::VM *vm, QBDI::GPRState *gprState)
         return;
     }
     uint64_t str = QBDI_GPR_GET(gprState, 1);
+    uint64_t len = QBDI_GPR_GET(gprState, 2);
+    jni_call_begin("NewString", gprState, 3);
+    appendformat("args1: <jchar* 0x%" PRIx64 " len=0x%" PRIx64 ">", str, len);
+    appendlogendl();
     if(debug)
     {
-        LOGE("JNI NewString: %s",(char*)str);
+        LOGE("JNI NewString: 0x%lx",str);
     }
-    appendlogendl();
-    appendlog("[log] JNI NewString: ");
-    appendlog((char*)str);
-    appendlogendl();
 }
 
 void trace_NewStringUTF(QBDI::VM *vm, QBDI::GPRState *gprState)
@@ -345,14 +385,12 @@ void trace_NewStringUTF(QBDI::VM *vm, QBDI::GPRState *gprState)
         return;
     }
     uint64_t str = QBDI_GPR_GET(gprState, 1);
+    jni_call_begin("NewStringUTF", gprState, 2);
+    jni_arg_cstr(1, str);
     if(debug)
     {
-        LOGE("JNI NewStringUTF: %s",(char*)str);
+        LOGE("JNI NewStringUTF: 0x%lx",str);
     }
-    appendlogendl();
-    appendlog("[log] JNI NewStringUTF: ");
-    appendlog((char*)str);
-    appendlogendl();
 }
 
 void addJNITrace(void* target,const char* funcname,TraceCallBack callback)
