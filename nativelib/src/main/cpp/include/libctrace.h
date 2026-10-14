@@ -32,6 +32,17 @@ void libc_kill(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_abort(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_exit(QBDI::VM *vm, QBDI::GPRState *gprState);
 void enable_libc_trace_debug(bool enable);
+
+/* ===== 已知函数/系统调用的参数解码（符号级 call func 与 SVC 注解共用） =====
+ * 对标 GumTrace 的 func_configs：把字符串参数写成 argsN: 行、
+ * 把缓冲区参数写成 hexdump。表只收录高价值的常见函数，
+ * 未收录的名字不输出任何参数行（与 GumTrace 对未知符号打印 () 一致）。 */
+
+/* 返回已知参数个数；未收录返回 -1 */
+int known_func_argc(const char* name);
+
+/* 按表打印 argsN: / hexdump 注解（未收录则不输出） */
+void known_func_emit_args(const char* name, const uint64_t* x);
 void libc_strlen(QBDI::VM *vm, QBDI::GPRState *gprState);
 void libc_memset(QBDI::VM *vm, QBDI::GPRState *gprState);
 

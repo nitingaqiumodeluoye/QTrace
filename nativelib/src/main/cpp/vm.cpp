@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <cstring>
+#include <strings.h>
 #include <cstdio>
 #include <cinttypes>
 #include <cstddef>
@@ -23,6 +24,8 @@
 #include "qbdihook.h"
 #include "jnitrace.h"
 #include "libctrace.h"
+#include "Symbols.h"
+#include "SyscallTable.h"
 #include "TraceLogger.h"
 #include "TraceUtils.h"
 #include "HookUtils.h"
@@ -369,6 +372,9 @@ size_t trace(size_t regs[31])
     struct timeval start, end;
     gettimeofday(&start, nullptr);
     vm* vm_ = new vm();
+    /* 符号表只读 /proc/self/maps 与 ELF 文件，不碰动态链接器锁
+     * （dladdr/dl_iterate_phdr 会取锁，在回调里调用有死锁风险）。 */
+    symbols_init();
     auto qvm = vm_->init(_g_trace_data->start,_g_trace_data->end);
     auto qbdi_state = qvm.getGPRState();
     initLogger(function_address);
@@ -541,6 +547,90 @@ bool checkJniCall_pre(QBDI::VM *vm, QBDI::GPRState *gprState,size_t target)
 static size_t lastAddr = 0;
 
 static unordered_map<uint32_t,char*> disassemblecache;
+
+/* ===== 调用注解：SVC 系统调用 / 符号级 call func ===== */
+
+// 计算 BL/BLR/BR 的跳转目标；无法确定返回 0。
+// 注意：AArch64 的分支立即数经 LLVM 解码后已是**绝对**目标地址
+// （QBDI 的 getFixedOperandValue 直接返回该值，与 disasm 里
+//  "bl #0x7522f46438" 显示的一致，也与下一条指令的地址一致）。
+static uint64_t branch_target(const QBDI::InstAnalysis *ia, QBDI::GPRState *gprState)
+{
+    if (ia == nullptr || ia->numOperands <= 0) {
+        return 0;
+    }
+    const QBDI::OperandAnalysis &op = ia->operands[0];
+    if (op.type == QBDI::OPERAND_IMM && (op.flag & QBDI::OPERANDFLAG_PCREL)) {
+        return (uint64_t)op.value;
+    }
+    if (op.type == QBDI::OPERAND_GPR && op.regCtxIdx >= 0) {
+        return (uint64_t)QBDI_GPR_GET(gprState, op.regCtxIdx);
+    }
+    return 0;
+}
+
+// call func: <name>(0x.., 0x..)
+static void emit_call_begin(const char *name, const uint64_t *x, int argc)
+{
+    char buf[384];
+    int off = snprintf(buf, sizeof(buf), "call func: %s(", name);
+    if (off < 0) {
+        return;
+    }
+    for (int i = 0; i < argc && off < (int)sizeof(buf) - 24; ++i) {
+        int n = snprintf(buf + off, sizeof(buf) - off, "%s0x%" PRIx64,
+                         i ? ", " : "", x[i]);
+        if (n > 0) {
+            off += ((size_t)n < sizeof(buf) - off) ? n : (int)(sizeof(buf) - off - 1);
+        }
+    }
+    snprintf(buf + off, sizeof(buf) - off, ")");
+    appendlog(buf);
+    appendlogendl();
+}
+
+// SVC：按 x8 的系统调用号打印调用注解（等价 GumTrace 的 svc_func_maps 分支）
+static bool emit_syscall_call(QBDI::GPRState *gprState)
+{
+    uint64_t x[8];
+    for (int i = 0; i < 8; ++i) {
+        x[i] = (uint64_t)QBDI_GPR_GET(gprState, i);
+    }
+    const char *name = syscall_name(x[8]);
+    if (name == nullptr) {
+        return false;   // 与 GumTrace 一致：未知系统调用号不产生注解
+    }
+    emit_call_begin(name, x, syscall_argc(x[8], x));
+    known_func_emit_args(name, x);
+    return true;
+}
+
+// 符号级 call func：跳转目标命中已加载模块的函数符号起始地址
+// （等价 GumTrace 的 func_maps 精确匹配）。
+// 对匿名区（如 ijiami VM 解包出的 r-x 段）不会有任何符号，自然不产生注解。
+static bool emit_symbol_call(const QBDI::InstAnalysis *ia, QBDI::GPRState *gprState)
+{
+    uint64_t target = branch_target(ia, gprState);
+    if (target == 0) {
+        return false;
+    }
+    const char *name = symbols_lookup_exact(target);
+    if (name == nullptr) {
+        return false;
+    }
+    uint64_t x[8];
+    for (int i = 0; i < 8; ++i) {
+        x[i] = (uint64_t)QBDI_GPR_GET(gprState, i);
+    }
+    // 未知符号按 GumTrace 的习惯打印 ()，已知函数才打印参数与解码结果
+    int argc = known_func_argc(name);
+    if (argc < 0) {
+        argc = 0;
+    }
+    emit_call_begin(name, x, argc);
+    known_func_emit_args(name, x);
+    return true;
+}
 
 // 显示指令执行前的寄存器状态
 QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FPRState *fprState, void *data)
@@ -725,6 +815,24 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
                     }
                 }
             }
+        }
+    }
+
+    /* SVC 系统调用：等价 GumTrace 的 ARM64_INS_SVC 分支 */
+    if (!hasCall && instAnalysis->mnemonic != nullptr &&
+        strcasecmp(instAnalysis->mnemonic, "svc") == 0) {
+        hasCall = emit_syscall_call(gprState);
+    }
+
+    /* 符号级 call func：BL/BLR/B/BR 的跳转目标命中模块函数符号时打印
+     * （等价 GumTrace 的 func_maps 精确匹配）。放在 hook 之后，
+     * 已被 libc/JNI/自定义 hook 命中的调用不会重复注解。 */
+    if (!hasCall && instAnalysis->mnemonic != nullptr &&
+        (instAnalysis->isCall || instAnalysis->isBranch)) {
+        const char *m = instAnalysis->mnemonic;
+        if (strcasecmp(m, "bl") == 0 || strcasecmp(m, "blr") == 0 ||
+            strcasecmp(m, "b") == 0 || strcasecmp(m, "br") == 0) {
+            hasCall = emit_symbol_call(instAnalysis, gprState);
         }
     }
 

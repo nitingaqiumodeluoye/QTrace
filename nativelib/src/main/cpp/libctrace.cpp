@@ -394,3 +394,132 @@ void libc_fopen(QBDI::VM *vm, QBDI::GPRState *gprState)
         LOGE("libc fopen:0x%lx",x0);
     }
 }
+
+/* ===== 已知函数/系统调用的参数解码表 =====
+ * 对标 GumTrace 的 func_configs（取其高价值子集）。
+ * 表项只在「符号级 call func」与「SVC 系统调用」两条路径上使用，
+ * 已经被 libc hook 命中的调用不会走到这里。 */
+struct KnownFunc {
+    const char* name;
+    int8_t argc;
+    int8_t str1;      // 字符串参数下标（-1 = 无）
+    int8_t str2;
+    int8_t hex_addr;  // hexdump 地址参数下标（-1 = 无）
+    int8_t hex_len;   // hexdump 长度参数下标（-2 = 按字符串长度）
+};
+
+static const KnownFunc kKnownFuncs[] = {
+    // 字符串
+    { "strlen", 1, 0, -1, -1, -1 },
+    { "__strlen_chk", 1, 0, -1, -1, -1 },
+    { "__strlen_aarch64", 1, 0, -1, -1, -1 },
+    { "strcmp", 2, 0, 1, -1, -1 },
+    { "strncmp", 2, 0, 1, -1, -1 },
+    { "strcasecmp", 2, 0, 1, -1, -1 },
+    { "strcpy", 2, 0, 1, -1, -1 },
+    { "strncpy", 2, 0, 1, -1, -1 },
+    { "strcat", 2, 0, 1, -1, -1 },
+    { "strncat", 2, 0, 1, -1, -1 },
+    { "strstr", 2, 0, 1, -1, -1 },
+    { "strcasestr", 2, 0, 1, -1, -1 },
+    { "strchr", 2, 0, -1, -1, -1 },
+    { "strrchr", 2, 0, -1, -1, -1 },
+    { "strdup", 1, 0, -1, -1, -1 },
+    { "strndup", 2, 0, -1, -1, -1 },
+    { "strlcpy", 3, 0, 1, -1, -1 },
+    { "strlcat", 3, 0, 1, -1, -1 },
+    // 内存
+    { "memcpy", 3, -1, -1, 1, 2 },
+    { "__memcpy_chk", 3, -1, -1, 1, 2 },
+    { "__memcpy_aarch64_simd", 3, -1, -1, 1, 2 },
+    { "memmove", 3, -1, -1, 1, 2 },
+    { "mempcpy", 3, -1, -1, 1, 2 },
+    { "memset", 3, -1, -1, -1, -1 },
+    { "memcmp", 3, -1, -1, 0, 2 },
+    { "memchr", 3, 0, -1, -1, -1 },
+    { "memmem", 4, -1, -1, 0, 1 },
+    // 文件 / 进程
+    { "open", 2, 0, -1, -1, -1 },
+    { "openat", 4, 1, -1, -1, -1 },
+    { "fopen", 2, 0, 1, -1, -1 },
+    { "fopen64", 2, 0, 1, -1, -1 },
+    { "read", 3, -1, -1, 1, 2 },
+    { "pread64", 4, -1, -1, 1, 2 },
+    { "write", 3, -1, -1, 1, 2 },
+    { "pwrite64", 4, -1, -1, 1, 2 },
+    { "close", 1, -1, -1, -1, -1 },
+    { "stat", 2, 0, -1, -1, -1 },
+    { "lstat", 2, 0, -1, -1, -1 },
+    { "fstat", 2, -1, -1, -1, -1 },
+    { "fstatat", 4, 1, -1, -1, -1 },
+    { "newfstatat", 4, 1, -1, -1, -1 },
+    { "access", 2, 0, -1, -1, -1 },
+    { "faccessat", 3, 1, -1, -1, -1 },
+    { "readlink", 3, 0, 1, -1, -1 },
+    { "readlinkat", 4, 1, 2, -1, -1 },
+    { "unlinkat", 3, 1, -1, -1, -1 },
+    { "mkdirat", 3, 1, -1, -1, -1 },
+    { "opendir", 1, 0, -1, -1, -1 },
+    { "popen", 2, 0, 1, -1, -1 },
+    { "execve", 3, 0, -1, -1, -1 },
+    { "__system_property_get", 2, 0, -1, -1, -1 },
+    // 格式化
+    { "sprintf", 2, 0, -1, -1, -1 },
+    { "snprintf", 3, 0, -1, -1, -1 },
+    { "sscanf", 2, 0, 1, -1, -1 },
+    { "fgets", 3, 0, -1, -1, -1 },
+    // 分配 / 映射
+    { "malloc", 1, -1, -1, -1, -1 },
+    { "calloc", 2, -1, -1, -1, -1 },
+    { "realloc", 2, -1, -1, -1, -1 },
+    { "free", 1, -1, -1, -1, -1 },
+    { "mmap", 6, -1, -1, -1, -1 },
+    { "mmap64", 6, -1, -1, -1, -1 },
+    { "mprotect", 3, -1, -1, -1, -1 },
+    // 动态链接
+    { "dlopen", 2, 0, -1, -1, -1 },
+    { "dlsym", 2, 1, -1, -1, -1 },
+    { "dlclose", 1, -1, -1, -1, -1 },
+};
+
+static const KnownFunc* find_known_func(const char* name)
+{
+    if (name == nullptr) {
+        return nullptr;
+    }
+    for (const KnownFunc& f : kKnownFuncs) {
+        if (strcmp(f.name, name) == 0) {
+            return &f;
+        }
+    }
+    return nullptr;
+}
+
+int known_func_argc(const char* name)
+{
+    const KnownFunc* f = find_known_func(name);
+    return (f == nullptr) ? -1 : (int)f->argc;
+}
+
+void known_func_emit_args(const char* name, const uint64_t* x)
+{
+    const KnownFunc* f = find_known_func(name);
+    if (f == nullptr || x == nullptr) {
+        return;
+    }
+    if (f->str1 >= 0) {
+        arg_string_from_reg(f->str1, x[f->str1]);
+    }
+    if (f->str2 >= 0) {
+        arg_string_from_reg(f->str2, x[f->str2]);
+    }
+    if (f->hex_addr >= 0) {
+        size_t len = 0;
+        if (f->hex_len == -2) {
+            len = 0;   // 按字符串长度（hexdump_to_log 内部处理）
+        } else if (f->hex_len >= 0) {
+            len = (size_t)x[f->hex_len];
+        }
+        hexdump_to_log(x[f->hex_addr], len, f->hex_len == -2);
+    }
+}
