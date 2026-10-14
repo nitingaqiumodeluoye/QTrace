@@ -23,7 +23,8 @@
 #include "logger.h"
 
 // 将内存块按 hexdump 格式输出到日志缓冲区
-void hexdump_memory(std::stringstream &logbuf, const uint8_t* data, size_t size, uint64_t address) ;
+void hexdump_memory(std::stringstream &logbuf, const uint8_t* data, size_t size, uint64_t address,
+                    int64_t header_size = -1) ;
 
 // 安全读取目标内存并按 GumTrace 格式写入日志（用于 call func 注解的 hexdump）
 void hexdump_to_log(uint64_t address, size_t count, bool force = false) ;

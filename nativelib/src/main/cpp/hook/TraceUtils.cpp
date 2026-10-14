@@ -6,9 +6,13 @@
 // GumTrace 格式:
 //   hexdump at address 0x1234 with length 0x10:
 //   1234: 48 74 74 70 ... |Http|
-void hexdump_memory(std::stringstream &logbuf, const uint8_t* data, size_t size, uint64_t address) {
+// header_size >= 0 时，标题里的 length 用它（用于 GumTrace 的 SPECIAL_32：
+// 标题显示传入的原始 count（如 0），而实际打印长度是 strnlen 的结果）。
+void hexdump_memory(std::stringstream &logbuf, const uint8_t* data, size_t size, uint64_t address,
+                    int64_t header_size) {
+    const size_t hdr = (header_size < 0) ? size : (size_t)header_size;
     logbuf << "hexdump at address 0x" << std::hex << address
-           << " with length 0x" << std::hex << size << ":\n";
+           << " with length 0x" << std::hex << hdr << ":\n";
 
     size_t offset = 0;
     while (offset < size) {
@@ -37,30 +41,82 @@ void hexdump_memory(std::stringstream &logbuf, const uint8_t* data, size_t size,
 }
 
 // 安全地把 [address, address+count) 的内存按 GumTrace 格式写入日志。
+/* 安全版的 strnlen：分块读，遇到不可读的页或 NUL 就停。
+ * GumTrace 在 SPECIAL_32 分支里是直接 strnlen(bytePtr, 4096)，
+ * 指针不可读时会把进程带走；我们用 process_vm_readv 分块读，
+ * 语义等价但不会崩（free 的参数正是已释放/即将释放的指针）。 */
+static size_t safe_strnlen(uint64_t address, size_t maxlen) {
+    if (maxlen == 0) {
+        return 0;
+    }
+    static thread_local std::vector<uint8_t> tmp;
+
+    // 先试一次读完（绝大多数情况都在同一页内）
+    tmp.resize(maxlen);
+    if (safeReadMemory(address, tmp.data(), maxlen)) {
+        size_t n = 0;
+        while (n < maxlen && tmp[n] != 0) {
+            ++n;
+        }
+        return n;
+    }
+
+    // 跨页/尾部不可读：按 64B 分块，读到不可读的块就停
+    tmp.resize(64);
+    size_t n = 0;
+    while (n < maxlen) {
+        size_t want = (maxlen - n < 64) ? (maxlen - n) : 64;
+        if (!safeReadMemory(address + n, tmp.data(), want)) {
+            if (want <= 1 || !safeReadMemory(address + n, tmp.data(), 1)) {
+                break;   // 连 1 字节都读不到，就到此为止
+            }
+            want = 1;
+        }
+        for (size_t i = 0; i < want; ++i) {
+            if (tmp[i] == 0) {
+                return n + i;
+            }
+        }
+        n += want;
+    }
+    return n;
+}
+
 // 用于 call func / call jni func 注解中的 hexdump（GumTrace 的 hexdump 注解）。
 void hexdump_to_log(uint64_t address, size_t count, bool force) {
     // AArch64 userspace 合法指针几乎都 > 4GB，小值当作整型参数丢弃
     if (address < 0x100000000ULL) {
         return;
     }
-    if (count == 0) {
+
+    /* 长度语义对齐 GumTrace::FuncPrinter::hexdump：
+     *   count > 0             => 打印 count 字节
+     *   count == 0 且 force    => SPECIAL_32，即 strnlen(ptr, 0x1000)
+     *                            （free / realloc / gettimeofday 走这条）
+     *   其余                   => 不打印
+     * 注意标题里的 length 始终是**传入的 count**：GumTrace 也是先把原始
+     * count 写进标题，之后才用 strnlen 覆盖局部变量，所以 free 的输出是
+     *     hexdump at address 0x... with length 0x0:
+     * 后面直接跟按 strnlen 长度切的数据行。 */
+    size_t print_len = count;
+    if (print_len == 0) {
         if (!force) {
             return;
         }
-        count = 256;
+        print_len = safe_strnlen(address, 0x1000);
     }
-    if (count > 0x1000) {
-        count = 0x1000;
+    if (print_len > 0x1000) {
+        print_len = 0x1000;
     }
 
     static thread_local std::vector<uint8_t> buf;
-    buf.resize(count);
-    if (!safeReadMemory(address, buf.data(), count)) {
+    buf.resize(print_len ? print_len : 1);
+    if (print_len > 0 && !safeReadMemory(address, buf.data(), print_len)) {
         return;
     }
 
     std::stringstream ss;
-    hexdump_memory(ss, buf.data(), count, address);
+    hexdump_memory(ss, buf.data(), print_len, address, (int64_t)count);
     appendlog(ss.str().c_str());
     appendlogendl();
 }

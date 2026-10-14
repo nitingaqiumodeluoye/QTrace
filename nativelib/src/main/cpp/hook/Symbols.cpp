@@ -39,6 +39,26 @@ struct Mapping {
     uint32_t module_idx = 0;
 };
 
+// ELF 的 PT_LOAD 段（只留判权限要用的字段）
+struct LoadSeg {
+    uint64_t vaddr = 0;
+    uint64_t memsz = 0;
+    uint32_t flags = 0;
+};
+
+/* 符号是否落在可读的 PT_LOAD 段里。
+ * 对应 Frida 的 gum_parse_phdr_protection：段含 PF_R 即 GUM_PAGE_READ，
+ * 而 GumTrace 的回调正是用它做 (section->protection & GUM_PAGE_READ) 判定。 */
+bool addr_in_readable_load(const std::vector<LoadSeg> &loads, uint64_t vaddr)
+{
+    for (const LoadSeg &s : loads) {
+        if (s.vaddr <= vaddr && vaddr < s.vaddr + s.memsz) {
+            return (s.flags & PF_R) != 0;
+        }
+    }
+    return false;
+}
+
 std::vector<Module> g_modules;
 std::vector<Mapping> g_mappings;
 bool g_inited = false;
@@ -58,33 +78,65 @@ bool read_at(int fd, void *buf, size_t len, off_t off)
     return true;
 }
 
-// 把一张符号表（.dynsym 或 .symtab）里的函数符号并入模块
-void ingest_symtab(Module &m, int fd, const Elf64_Shdr &symtab,
-                   const Elf64_Shdr &strtab)
+/* 把一张符号表（.symtab 或 .dynsym）里的符号并入模块。
+ * 返回**枚举到的符号条目数**（含后来被过滤掉的）：调用方用它复现 Frida 的
+ * “.symtab 一个都没发出才回退 .dynsym”行为。
+ *
+ * 过滤规则对齐 GumTrace（即 Frida 的 gum_module_enumerate_symbols 链路）：
+ *   - **不按 STT 类型过滤**：只要符号所在 section 参与运行时可读映射，
+ *     数据符号（STT_OBJECT/STT_NOTYPE）也收。
+ *     Frida 的 gum_emit_symbol（backend-elf/gummodule-elf.c）把
+ *     GUM_ELF_SYMBOL_* 全数回调，不做类型筛；GumTrace 的回调只检查
+ *     address != 0 与 (section->protection & GUM_PAGE_READ)。
+ *   - “可读”的判据是 section 的**地址所在 PT_LOAD 段**含 PF_R
+ *     （gum_elf_module_load_section_details 用
+      *      gum_elf_module_find_address_protection 按 program header 算 protection）。
+ *     ELF 里非分配段（SHF_ALLOC 未置位）在运行时不存在，直接排除；
+ *     SHN_UNDEF / SHN_ABS / SHN_COMMON 这类没有 section 的符号
+ *     在 Frida 里 section == NULL，同样排除。
+ *
+ * 旧实现只要 STT_FUNC / STT_GNU_IFUNC，因此 local 符号与数据符号全都漏了，
+ * 比 GumTrace 窄。 */
+size_t ingest_symtab(Module &m, int fd, const Elf64_Shdr &symtab,
+                     const Elf64_Shdr &strtab, const std::vector<Elf64_Shdr> &shdrs,
+                     const std::vector<LoadSeg> &loads)
 {
     if (symtab.sh_size == 0 || symtab.sh_entsize == 0 || strtab.sh_size == 0) {
-        return;
+        return 0;
     }
     if (symtab.sh_size > MAX_PARSE_BYTES || strtab.sh_size > MAX_PARSE_BYTES) {
-        return;
+        return 0;
     }
 
     std::vector<Elf64_Sym> syms(symtab.sh_size / sizeof(Elf64_Sym));
     if (!read_at(fd, syms.data(), symtab.sh_size, (off_t)symtab.sh_offset)) {
-        return;
+        return 0;
     }
     std::vector<char> strs(strtab.sh_size);
     if (!read_at(fd, strs.data(), strtab.sh_size, (off_t)strtab.sh_offset)) {
-        return;
+        return 0;
     }
 
+    size_t seen = 0;
     for (const Elf64_Sym &s : syms) {
-        if (s.st_value == 0 || s.st_name == 0 || s.st_name >= strs.size()) {
+        if (s.st_name == 0 || s.st_name >= strs.size()) {
             continue;
         }
-        unsigned type = ELF64_ST_TYPE(s.st_info);
-        // 只要函数（含 GNU ifunc）
-        if (type != STT_FUNC && type != STT_GNU_IFUNC) {
+        ++seen;
+        if (s.st_value == 0) {
+            continue;
+        }
+        // 没有 section 的符号（未定义/绝对/COMMON）在 Frida 里是 section == NULL，排除
+        if (s.st_shndx == SHN_UNDEF || s.st_shndx >= SHN_LORESERVE ||
+            s.st_shndx >= shdrs.size()) {
+            continue;
+        }
+        // 不参与运行时的 section（未置 SHF_ALLOC）没有映射，保护位算不出来，排除
+        if ((shdrs[s.st_shndx].sh_flags & SHF_ALLOC) == 0) {
+            continue;
+        }
+        // 真正对应 GumTrace 的 (section->protection & GUM_PAGE_READ)
+        if (!addr_in_readable_load(loads, s.st_value)) {
             continue;
         }
         const char *nm = strs.data() + s.st_name;
@@ -98,6 +150,8 @@ void ingest_symtab(Module &m, int fd, const Elf64_Shdr &symtab,
         m.names.insert(m.names.end(), nm, nm + nm_len + 1); // 含终止符
         m.syms.push_back(SymEntry{ m.base + s.st_value, off });
     }
+
+    return seen;
 }
 
 // 惰性解析模块的符号表
@@ -133,9 +187,34 @@ void parse_module(Module &m)
         return;
     }
 
-    // 先 .dynsym（导出符号，发布版必有），再 .symtab（未 strip 时更全）
-    for (int pass = 0; pass < 2; ++pass) {
-        const uint32_t want = (pass == 0) ? SHT_DYNSYM : SHT_SYMTAB;
+    /* 读 PT_LOAD 段：GumTrace 的过滤条件是“符号所在 section 可读”，
+     * 而 Frida 的 protection 是按 program header 的 PF_R 算的
+     * （gum_elf_module_find_address_protection -> gum_parse_phdr_protection）。 */
+    std::vector<LoadSeg> loads;
+    if (eh.e_phoff != 0 && eh.e_phnum != 0 &&
+        eh.e_phentsize == sizeof(Elf64_Phdr) &&
+        (uint64_t)eh.e_phnum * sizeof(Elf64_Phdr) <= MAX_PARSE_BYTES) {
+        std::vector<Elf64_Phdr> phdrs(eh.e_phnum);
+        if (read_at(fd, phdrs.data(), (size_t)eh.e_phnum * sizeof(Elf64_Phdr),
+                    (off_t)eh.e_phoff)) {
+            for (const Elf64_Phdr &p : phdrs) {
+                if (p.p_type == PT_LOAD) {
+                    loads.push_back(LoadSeg{ p.p_vaddr, p.p_memsz, p.p_flags });
+                }
+            }
+        }
+    }
+
+    /* 符号表选择对齐 Frida/GumTrace：**优先 .symtab**，只有当它一条都没枚举到
+     * 时才回退到 .dynsym。gumelfmodule.c 的实现就是：
+     *     gum_elf_module_enumerate_symbols_in_section (self, GUM_ELF_SECTION_SYMTAB, ...);
+     *     if (ctx.count == 0)
+     *       gum_elf_module_enumerate_dynamic_symbols (self, func, user_data);
+     * 注意不是把两张表合并 —— 之前的实现先 dynsym 再 symtab 全收，
+     * 与 GumTrace 的集合不同。 */
+    size_t seen = 0;
+    for (int pass = 0; pass < 2 && seen == 0; ++pass) {
+        const uint32_t want = (pass == 0) ? SHT_SYMTAB : SHT_DYNSYM;
         for (const Elf64_Shdr &sh : shdrs) {
             if (sh.sh_type != want || sh.sh_link >= shdrs.size()) {
                 continue;
@@ -144,7 +223,7 @@ void parse_module(Module &m)
             if (strtab.sh_type != SHT_STRTAB) {
                 continue;
             }
-            ingest_symtab(m, fd, sh, strtab);
+            seen += ingest_symtab(m, fd, sh, strtab, shdrs, loads);
         }
     }
 
