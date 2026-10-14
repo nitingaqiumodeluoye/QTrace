@@ -10,6 +10,8 @@
 #include <cctype>
 #include <vector>
 #include <sys/uio.h>
+#include <elf.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <atomic>
 #include <cstdint>
@@ -327,20 +329,96 @@ static void installGvmJniOnLoadTrace(size_t gvmBase)
     }
 }
 
+/* 从 ELF 程序头反推 libGameVMP.so 的载入基址。
+ *
+ * 为何不能直接取 maps 里第一行：
+ *   ijiami VM 会把代码段解密后**匿名**映射（mmap 匿名 + mprotect r-x），
+ *   于是 /proc/self/maps 里只剩数据段带 libGameVMP.so 路径。实测该任务进程：
+ *       72f6150000-...           r-xp  (匿名，解密后的代码，连 ELF 头都在)
+ *       72f61bb000-72f61bc000    r--p  off=00023000  .../libGameVMP.so
+ *       72f61bc000-72f61bf000    rw-p  off=00024000  .../libGameVMP.so
+ *   旧实现取第一行（含 libGameVMP.so 的第一条）会得到数据段地址
+ *   0x72f61bb000，比真实基址 0x72f6150000 高 0x6b000 —— 于是
+ *   JNI_OnLoad 算到未映射区间（0x72f61bf104），looksLikePrologue 永远为假，
+ *   轮询 10s 后 “prologue never appeared”，整个 trace 无法启动。
+ *   （文件段布局：PT_LOAD0 off=0 vaddr=0 R-X；PT_LOAD1 off=0x238e0
+ *     vaddr=0x6b8e0 RW-，故差 0x6b000 正是数据段页对齐后的 vaddr。）
+ *
+ * 做法：把 maps 里的 (映射起点, 文件偏移) 与 ELF 的 PT_LOAD 配对，
+ *       load_base = 映射起点 - align_down(p_vaddr, page)；
+ *       取所有候选里最小的（第一个 PT_LOAD 的 vaddr 最小 = 真正的基址）。
+ * 同一进程实测：load_base+0x4104 的内存为 ff 83 01 d1（sub sp, sp, #0x60），
+ *       正是 looksLikePrologue 认的序言；而磁盘文件同偏移是加密字节。
+ * 代码段仍然带路径（file_off==0）的旧形态也能算对 —— 那条映射自身就会
+ *       给出 candidate = start - 0 = load_base。
+ */
 static size_t gvmModuleBase()
 {
-    size_t base = 0;
+    struct MapEntry { size_t start; size_t file_off; char path[512]; };
+    std::vector<MapEntry> ents;
+
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) return 0;
     char* line = nullptr; size_t len = 0;
     while (getline(&line, &len, fp) != -1) {
-        if (strstr(line, "libGameVMP.so") && base == 0) {
-            sscanf(line, "%lx", &base);
+        unsigned long long s = 0, off = 0;
+        char perms[8] = {0};
+        MapEntry e{};
+        // 格式: start-end perms offset dev inode path
+        if (sscanf(line, "%llx-%*x %7s %llx %*s %*s %511s",
+                   &s, perms, &off, e.path) != 4) {
+            continue;
         }
+        if (strstr(e.path, "libGameVMP.so") == nullptr) {
+            continue;
+        }
+        e.start = (size_t)s;
+        e.file_off = (size_t)off;
+        ents.push_back(e);
     }
     free(line);
     fclose(fp);
-    return base;
+    if (ents.empty()) return 0;
+
+    const long page = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = (page > 0) ? (uint64_t)page : 4096ULL;
+    const uint64_t page_mask = page_sz - 1;
+
+    size_t best = 0;
+    int fd = open(ents[0].path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        Elf64_Ehdr eh;
+        if (pread(fd, &eh, sizeof(eh), 0) == (ssize_t)sizeof(eh) &&
+            memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0 &&
+            eh.e_ident[EI_CLASS] == ELFCLASS64 &&
+            eh.e_phoff != 0 && eh.e_phnum != 0 &&
+            eh.e_phentsize == sizeof(Elf64_Phdr) &&
+            (uint64_t)eh.e_phnum * sizeof(Elf64_Phdr) <= 4u * 1024 * 1024) {
+            std::vector<Elf64_Phdr> phdrs(eh.e_phnum);
+            const size_t want = phdrs.size() * sizeof(Elf64_Phdr);
+            if (pread(fd, phdrs.data(), want, (off_t)eh.e_phoff) == (ssize_t)want) {
+                for (const MapEntry& e : ents) {
+                    for (const Elf64_Phdr& p : phdrs) {
+                        if (p.p_type != PT_LOAD) continue;
+                        if ((p.p_offset & ~page_mask) != e.file_off) continue;
+                        size_t cand = e.start - (size_t)(p.p_vaddr & ~page_mask);
+                        if (cand != 0 && (best == 0 || cand < best)) {
+                            best = cand;
+                        }
+                    }
+                }
+            }
+        }
+        close(fd);
+    }
+
+    if (best != 0) {
+        LOGI("gvm: load base resolved 0x%zx (from %zu map entries)", best, ents.size());
+        return best;
+    }
+    // 降级：程序头没读成时退回旧行为
+    LOGW("gvm: ELF phdr unavailable, falling back to first mapping 0x%zx", ents[0].start);
+    return ents[0].start;
 }
 
 static void* gvm_dlopen_ext(const char* filename, int flags, const void* extinfo)
