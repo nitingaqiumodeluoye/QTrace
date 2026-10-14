@@ -548,6 +548,175 @@ static size_t lastAddr = 0;
 
 static unordered_map<uint32_t,char*> disassemblecache;
 
+/* 哪些助记符的最后一个操作数是 PC 相对的立即数（需要改写成绝对地址）。
+ *
+ * 名单依据 LLVM 的 AArch64InstrFormats.td（均已核对 OperandType）：
+ *   bl/b、cbz/cbnz、tbz/tbnz → BranchTarget / am_brcond：OPERAND_PCREL
+ *   adr / adrp               → adrlabel / adrplabel：OPERAND_PCREL
+ *   ldr* / prfm 字面量形式     → am_ldrlit：OPERAND_PCREL
+ * 不含 br/blr（它们是寄存器形式，无立即数）。
+ *
+ * 日志里不区分 adrp：它确实也是 OPERAND_PCREL，单独处理的原因不是标志位，
+ * 而是【公式不同（页基址而非 PC）且打印格式不同（十进制而非十六进制）】。
+ *
+ * 字面量加载（ldr x0, #label）与普通内存形式（ldr x0, [x1, #0x10]）
+ * 靠有无方括号区分：只处理没有 '[' 的。真机 trace 里字面量形式 0 条，
+ * 加上是为了以后换目标也不静默出错，不影响已验证的路径。
+ */
+static bool is_pcrel_imm_mnemonic(const char *m, const char *line, bool *out_is_adrp)
+{
+    *out_is_adrp = false;
+    if (m == nullptr) {
+        return false;
+    }
+    if (strcasecmp(m, "adrp") == 0) {
+        *out_is_adrp = true;
+        return true;
+    }
+    if (strcasecmp(m, "adr") == 0)  { return true; }
+    if (strcasecmp(m, "bl") == 0)   { return true; }
+    if (strcasecmp(m, "cbz") == 0)  { return true; }
+    if (strcasecmp(m, "cbnz") == 0) { return true; }
+    if (strcasecmp(m, "tbz") == 0)  { return true; }
+    if (strcasecmp(m, "tbnz") == 0) { return true; }
+    // b / b.<cond>
+    if ((m[0] == 'b' || m[0] == 'B') && (m[1] == '\0' || m[1] == '.')) {
+        return true;
+    }
+    // 字面量加载 / 预取：没有方括号才是字面量形式
+    if (line != nullptr && strchr(line, '[') == nullptr) {
+        if (strncmp(m, "ldr", 3) == 0 || strcmp(m, "prfm") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 把 PC 相对的分支/寻址目标改写成绝对地址，结果写到 out（容量 out_size）。
+ *
+ * 背景（均经真实 trace 实测）：LLVM 的 AArch64 打印器打的是**相对量**，
+ * capstone（GumTrace 用的）打的是**绝对地址**：
+ *     现在: bl #-0x1107c        b.ls #0x304       adrp x8, #339968（十进制，字节）
+ *     应  : bl #0x7927a3e7d8    b.ls #0x7927a60ed4  adrp x8, #0x7927aa2000
+ * 验证依据：113/113 条无条件分支满足 pc+imm == 下一行地址；
+ *          adrp 的 339968 = 0x53000 字节，(pc&~0xfff)+0x53000 == 注解里的 x8 值。
+ *
+ * 不修正的后果：
+ * - trace-ui 把 BL 的立即数当目标地址用（scan_unified/chunk_scan 的 CallTree），
+ *   会直接建出错误的调用树节点
+ * - QTrace 自己的符号级 call func 拿这个值查符号表，永远命不中
+ *   （实测：18089 条 bl # 指令，0 条后面跟 call func:）
+ *
+ * 【为什么不用 OPERANDFLAG_PCREL 判定】该标志确实准确（BranchTarget / am_brcond /
+ * adrlabel / adrplabel / am_ldrlit 在 .td 里都声明了 OPERAND_PCREL），
+ * 但我们还需要区分【adrp 的页基址公式】与【分支的 PC 公式】、
+ * 以及【字面量 ldr 与内存 ldr】—— 这两项用标志位都区分不了，用助记符反而更精确：
+ * "ldr x0, [x1, #0x10]" 里的 # 偏移必须保持原样，已在真机 trace 上验证
+ * 18209/18209 条内存偏移原封不动（本轮全量回归则是 312426/312426）。
+ *
+ * 因为绝对地址比原始位移长（"#0x304" -> "#0x7927a60ed4"，6 字节变 13 字节），
+ * 不能原地改写，必须写到独立缓冲，否则会被截断成 "#0x792" 这种错地址。
+ */
+static void fixup_pcrel_immediates(const char *in, uint64_t pc, char *out, size_t out_size)
+{
+    if (in == nullptr || out == nullptr || out_size == 0) {
+        return;
+    }
+    snprintf(out, out_size, "%s", in);   // 默认原样
+
+    // 助记符直接从文本里取第一个 token（和 trace-ui 的做法一致）：
+    // 这样不依赖 QBDI 的 ANALYSIS_INSTRUCTION，也避免 "b.<cond>" 这类
+    // 条件分支助记符是否带后缀的歧义。
+    char mnem[16];
+    size_t mi = 0;
+    for (const char *s = in; *s != '\0' && *s != ' ' && *s != '\t' && mi + 1 < sizeof(mnem); ++s) {
+        mnem[mi++] = *s;
+    }
+    mnem[mi] = '\0';
+
+    bool is_adrp = false;
+    if (!is_pcrel_imm_mnemonic(mnem, in, &is_adrp)) {
+        return;
+    }
+
+    // PC 相对的目标一定是操作数列表里的最后一个，取最后一个 '#'
+    const char *hash = strrchr(in, '#');
+    if (hash == nullptr) {
+        return;
+    }
+    const size_t prefix = (size_t)(hash - in);
+    if (prefix + 1 >= out_size) {
+        return;
+    }
+
+    // 解析数值（可带负号；adrp 打印的是十进制，分支是十六进制 —— 两种都能解析）
+    const char *p = hash + 1;
+    bool negative = false;
+    if (*p == '-') { negative = true; ++p; }
+    int base = 10;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
+    char *endp = nullptr;
+    unsigned long long mag = strtoull(p, &endp, base);
+    if (endp == p) {
+        return;   // 没解析到数字（例如已经被改写过），不处理
+    }
+    int64_t imm = negative ? -(int64_t)mag : (int64_t)mag;
+
+    uint64_t target;
+    if (is_adrp) {
+        // adrp 的立即数是相对**页基址**的字节偏移
+        target = (pc & ~(uint64_t)0xfff) + (uint64_t)imm;
+    } else {
+        // 分支/adr 的立即数是相对**当前 PC** 的字节偏移
+        target = pc + (uint64_t)imm;
+    }
+
+    // 保留 # 之后可能存在的非数字后缀
+    char suffix[24];
+    size_t si = 0;
+    while (*endp != '\0' && si + 1 < sizeof(suffix)) {
+        suffix[si++] = *endp++;
+    }
+    suffix[si] = '\0';
+
+    snprintf(out + prefix, out_size - prefix, "#0x%" PRIx64 "%s", target, suffix);
+}
+
+/* 把 LLVM 的 #0xN（N 为单个十六进制位）改成 capstone 的十进制 #N。
+ *
+ * 实测 capstone（GumTrace 用的）的规则：立即数值 <= 9 打印十进制，>= 10 打印十六进制，
+ *     add x0, x1, #1 / #9 / #0xa / #0x10 / #0x80
+ * 而 LLVM 设了 PrintImmHex 后一律打十六进制：
+ *     add x0, x1, #0x1 / #0x9 / #0xa / #0x10 / #0x80
+ * 所以只有“单数字”这一种情况需要改（real trace 里占 15.9% 的行）。
+ *
+ * 对 trace-ui 而言这是纯文本差异（parse_imm 两种都认，内存地址又取自
+ * mem_r=/mem_w= 注解），但对“与 GumTrace 对拍”影响很大。
+ * 只作用于 `#` 开头的立即数，且要求后面不再是十六进制位，不会碰到寄存器名。
+ */
+static void fixup_small_immediates(char *line)
+{
+    if (line == nullptr) {
+        return;
+    }
+    char *r = line;
+    char *w = line;
+    while (*r != '\0') {
+        if (r[0] == '#' && r[1] == '0' && (r[2] == 'x' || r[2] == 'X') &&
+            r[3] >= '0' && r[3] <= '9' &&
+            !((r[4] >= '0' && r[4] <= '9') || (r[4] >= 'a' && r[4] <= 'f') ||
+              (r[4] >= 'A' && r[4] <= 'F'))) {
+            // #0xN  ->  #N   (N = 0..9)
+            *w++ = '#';
+            *w++ = r[3];
+            r += 4;
+            continue;
+        }
+        *w++ = *r++;
+    }
+    *w = '\0';
+}
+
 /* LLVM 的 AArch64 打印器用 TAB 分隔助记符与操作数（"\tsub\tsp, sp, #0x40"），
  * 而 GumTrace/capstone 用空格（"sub sp, sp, #0x40"）。
  * trace-ui 按「第一个空格」切分助记符，TAB 会让它取到 "sub\tsp," 这种错误助记符，
@@ -582,20 +751,42 @@ static void normalize_disasm(char *s)
 /* ===== 调用注解：SVC 系统调用 / 符号级 call func ===== */
 
 // 计算 BL/BLR/BR 的跳转目标；无法确定返回 0。
-// 注意：AArch64 的分支立即数经 LLVM 解码后已是**绝对**目标地址
-// （QBDI 的 getFixedOperandValue 直接返回该值，与 disasm 里
-//  "bl #0x7522f46438" 显示的一致，也与下一条指令的地址一致）。
-static uint64_t branch_target(const QBDI::InstAnalysis *ia, QBDI::GPRState *gprState)
+/* 取跳转目标（调用方已按助记符过滤为 bl/blr/b/br）。
+ *
+ * 立即数形式（b/bl）直接用**已经改写成绝对地址的 disasm 文本**里的目标。
+ * 这样做的好处是“一致 by construction”：trace-ui 的调用树就是从这行文本里
+ * 解析出的目标建的，两边不可能不一致。
+ *（也可以走 ia->operands[0].value + pc，两者的底层依据相同：
+ *  LLVM 的 DecodePCRelLabel19 把 ImmVal 原样放进 MCOperand，
+ *  printAlignedLabel 在 PrintBranchImmAsAddress 为假时又原样打印，
+ *  所以操作数值就是打印值；但直接用文本少一层依赖。）
+ *
+ * 寄存器形式（br/blr）必须读运行时寄存器值。operands[0] 一定是**显式**的第一个
+ * 操作数：QBDI 的 analyseOperands 先遍历 MCInst 的显式操作数，隐式寄存器
+ * （如 BL 的 LR 隐式写）是追加在末尾的 —— 所以 "bl #imm" 的 operands[0]
+ * 是立即数、"blr x8" 的是 x8，不会串到 LR。
+ *
+ * 文本里目标已是 "#0x..."（fixup 后）。若因为助记符不在名单里等原因没有改写成，
+ * strtoull 会得到 0，于是退回寄存器分支也拿不到值，返回 0 即不输出注解
+ *（静默降级，不会输出错地址）。
+ */
+static uint64_t branch_target(const char *disasm, const QBDI::InstAnalysis *ia,
+                              QBDI::GPRState *gprState)
 {
-    if (ia == nullptr || ia->numOperands <= 0) {
-        return 0;
+    if (disasm != nullptr) {
+        const char *hash = strrchr(disasm, '#');
+        if (hash != nullptr) {
+            unsigned long long v = strtoull(hash + 1, nullptr, 16);
+            if (v != 0) {
+                return (uint64_t)v;
+            }
+        }
     }
-    const QBDI::OperandAnalysis &op = ia->operands[0];
-    if (op.type == QBDI::OPERAND_IMM && (op.flag & QBDI::OPERANDFLAG_PCREL)) {
-        return (uint64_t)op.value;
-    }
-    if (op.type == QBDI::OPERAND_GPR && op.regCtxIdx >= 0) {
-        return (uint64_t)QBDI_GPR_GET(gprState, op.regCtxIdx);
+    if (ia != nullptr && ia->numOperands > 0) {
+        const QBDI::OperandAnalysis &op = ia->operands[0];
+        if (op.type == QBDI::OPERAND_GPR && op.regCtxIdx >= 0) {
+            return (uint64_t)QBDI_GPR_GET(gprState, op.regCtxIdx);
+        }
     }
     return 0;
 }
@@ -639,9 +830,10 @@ static bool emit_syscall_call(QBDI::GPRState *gprState)
 // 符号级 call func：跳转目标命中已加载模块的函数符号起始地址
 // （等价 GumTrace 的 func_maps 精确匹配）。
 // 对匿名区（如 ijiami VM 解包出的 r-x 段）不会有任何符号，自然不产生注解。
-static bool emit_symbol_call(const QBDI::InstAnalysis *ia, QBDI::GPRState *gprState)
+static bool emit_symbol_call(const char *disasm, const QBDI::InstAnalysis *ia,
+                             QBDI::GPRState *gprState)
 {
-    uint64_t target = branch_target(ia, gprState);
+    uint64_t target = branch_target(disasm, ia, gprState);
     if (target == 0) {
         return false;
     }
@@ -700,19 +892,28 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
     const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION  | QBDI::ANALYSIS_OPERANDS);
     uint32_t bytecode = *(uint32_t*)instAnalysis->address;
 
-    //用缓存的反汇编，减低开销
-    char* disasm;
+    // 用缓存的反汇编，降低开销。
+    // 注意：缓存里只放**与 PC 无关**的规范化文本；PCREL 目标会被改写成绝对地址，
+    // 依赖当前 PC，必须在每次输出时重算 —— 同一 bytecode 可能出现在不同地址
+    // （VM 解包区常有代码拷贝），若把绝对地址写进缓存就会错址。
+    char disasm_buf[256];
     auto it = disassemblecache.find(bytecode);
+    const char *base_disasm;
     if (it != disassemblecache.end()) {
-        disasm = it->second;
+        base_disasm = it->second;
     } else {
         const QBDI::InstAnalysis *full = vm->getInstAnalysis(QBDI::ANALYSIS_DISASSEMBLY);
         size_t len = strlen(full->disassembly) + 1;
-        disasm = (char*)malloc(len);
-        memcpy(disasm, full->disassembly, len);
-        normalize_disasm(disasm);
-        disassemblecache.emplace(bytecode, disasm);
+        char *cached = (char*)malloc(len + 1);
+        memcpy(cached, full->disassembly, len);
+        normalize_disasm(cached);
+        fixup_small_immediates(cached);
+        disassemblecache.emplace(bytecode, cached);
+        base_disasm = cached;
     }
+    fixup_pcrel_immediates(base_disasm, (uint64_t)instAnalysis->address,
+                           disasm_buf, sizeof(disasm_buf));
+    const char *disasm = disasm_buf;
 
     int off = 0;
     /* trace-ui GumTrace 格式: [模块名] 0x绝对地址!0x相对偏移 助记符 操作数; 读寄存器 mem_r/w=地址 -> 写寄存器 */
@@ -882,7 +1083,7 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
         const char *m = instAnalysis->mnemonic;
         if (strcasecmp(m, "bl") == 0 || strcasecmp(m, "blr") == 0 ||
             strcasecmp(m, "b") == 0 || strcasecmp(m, "br") == 0) {
-            hasCall = emit_symbol_call(instAnalysis, gprState);
+            hasCall = emit_symbol_call(disasm, instAnalysis, gprState);
         }
     }
 
